@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "mst.agent-launchers",
+  "name": "AI Agent Launchers",
+  "version": "1.4.0",
+  "author": "Matthias Stache",
+  "description": "One icon with a context menu to launch/resume Claude, Codex, and Antigravity, plus a list of running and recent sessions of all three, with session indicators and read-only quota tooltips.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "AgentLaunchers.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Agent Launchers",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

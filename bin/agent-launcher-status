@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""Read-only status helper for mst.agent-launchers.
+
+It never reads or prints OAuth tokens. Quotas are taken from local usage/cache
+files already maintained by Omarchy or an Antigravity usage plugin/tool.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Any, Iterable
+
+HOME = pathlib.Path.home()
+WORK = (HOME / "Work").resolve()
+
+
+def read_json(path: pathlib.Path) -> Any | None:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def fmt_reset(value: Any) -> str:
+    if value in (None, "", 0):
+        return ""
+    try:
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value), tz=timezone.utc).astimezone()
+        else:
+            s = str(value).strip()
+            if re.fullmatch(r"\d+(?:\.\d+)?", s):
+                dt = datetime.fromtimestamp(float(s), tz=timezone.utc).astimezone()
+            else:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone()
+        now = datetime.now().astimezone()
+        if dt.date() == now.date():
+            return dt.strftime("%H:%M")
+        return dt.strftime("%d.%m. %H:%M")
+    except Exception:
+        return str(value)
+
+
+def normalize_fraction(value: Any, *, already_percent: bool = False) -> float | None:
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    if already_percent or x > 1.00001:
+        x /= 100.0
+    return max(0.0, min(1.0, x))
+
+
+def codex_resumable() -> bool:
+    sessions = HOME / ".codex" / "sessions"
+    if not sessions.is_dir():
+        return False
+    try:
+        files = sorted(sessions.glob("*/*/*/rollout-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:80]
+    except OSError:
+        return False
+
+    target = str(WORK)
+    for path in files:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for _ in range(12):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    obj = json.loads(line)
+                    if obj.get("type") != "session_meta":
+                        continue
+                    payload = obj.get("payload") or {}
+                    cwd = payload.get("cwd")
+                    if cwd and str(pathlib.Path(cwd).expanduser().resolve()) == target:
+                        return True
+                    break
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
+
+
+def agy_resumable() -> bool:
+    path = HOME / ".gemini" / "antigravity-cli" / "cache" / "last_conversations.json"
+    data = read_json(path)
+    if not isinstance(data, dict):
+        return False
+    target = str(WORK)
+    return bool(data.get(target))
+
+
+def claude_resumable() -> bool:
+    config_dir = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude")).expanduser()
+    projects = config_dir / "projects"
+    if not projects.is_dir():
+        return False
+
+    encoded = "-" + str(WORK).lstrip("/").replace("/", "-")
+    direct = projects / encoded
+    try:
+        if direct.is_dir() and any(direct.glob("*.jsonl")):
+            return True
+    except OSError:
+        pass
+
+    target = str(WORK)
+    try:
+        files = sorted(projects.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]
+    except OSError:
+        return False
+    for path in files:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for _ in range(20):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    obj = json.loads(line)
+                    if obj.get("cwd") == target:
+                        return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
+
+
+def omarchy_usage_candidates(ids: Iterable[str]) -> list[pathlib.Path]:
+    root = HOME / ".local" / "state" / "omarchy" / "agents" / "usage"
+    return [root / f"{name}.json" for name in ids]
+
+
+def parse_omarchy_limits(data: Any) -> tuple[str, list[str]] | None:
+    if not isinstance(data, dict):
+        return None
+    limits = data.get("limits")
+    if not isinstance(limits, list) or not limits:
+        return None
+
+    tier = str(data.get("tierLabel") or "").strip()
+    lines: list[str] = []
+    for limit in limits[:4]:
+        if not isinstance(limit, dict):
+            continue
+        label = str(limit.get("label") or "Limit").strip()
+        used = normalize_fraction(limit.get("percent"))
+        if used is None and limit.get("usedPercent") is not None:
+            used = normalize_fraction(limit.get("usedPercent"), already_percent=True)
+        if used is None:
+            continue
+        remaining = round((1.0 - used) * 100)
+        reset = fmt_reset(limit.get("resetsAt") or limit.get("resetTime") or limit.get("reset_time"))
+        line = f"{label}: {remaining}% frei"
+        if reset:
+            line += f" · Reset {reset}"
+        lines.append(line)
+    return (tier, lines) if lines else None
+
+
+def codex_quota() -> list[str]:
+    for path in omarchy_usage_candidates(["codex"]):
+        data = read_json(path)
+        parsed = parse_omarchy_limits(data)
+        if parsed:
+            tier, lines = parsed
+            out = []
+            if tier:
+                out.append(f"Plan: {tier}")
+            out.extend(lines)
+            return out
+    return ["Quota: noch kein lokaler Omarchy-Usage-Stand gefunden"]
+
+
+def claude_quota() -> list[str]:
+    for path in omarchy_usage_candidates(["claude"]):
+        data = read_json(path)
+        parsed = parse_omarchy_limits(data)
+        if parsed:
+            tier, lines = parsed
+            out = []
+            if tier:
+                out.append(f"Plan: {tier}")
+            out.extend(lines)
+            return out
+        if isinstance(data, dict):
+            status = str(data.get("usageStatusText") or "").strip()
+            help_text = str(data.get("authHelpText") or "").strip()
+            out = []
+            if status:
+                out.append(f"Status: {status}")
+            if help_text:
+                out.append(help_text)
+            if out:
+                return out
+    return ["Quota: noch kein lokaler Claude-Usage-Stand gefunden"]
+
+
+def walk_dicts(obj: Any):
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from walk_dicts(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from walk_dicts(value)
+
+
+def generic_remaining_candidates(data: Any) -> list[tuple[str, float, str]]:
+    out: list[tuple[str, float, str]] = []
+    for d in walk_dicts(data):
+        label = str(d.get("displayName") or d.get("label") or d.get("model") or d.get("name") or "Quota")
+        reset = fmt_reset(d.get("resetTime") or d.get("reset_time") or d.get("resetsAt") or d.get("resets_at"))
+
+        remaining = None
+        for key in ("remainingFraction", "remaining_fraction"):
+            if key in d:
+                remaining = normalize_fraction(d.get(key))
+                break
+        if remaining is None:
+            for key in ("remainingPercent", "remaining_percent", "remaining_pct"):
+                if key in d:
+                    remaining = normalize_fraction(d.get(key), already_percent=True)
+                    break
+        if remaining is None and "percent" in d and ("reset" in " ".join(d.keys()).lower() or "quota" in " ".join(d.keys()).lower()):
+            used = normalize_fraction(d.get("percent"))
+            if used is not None:
+                remaining = 1.0 - used
+        if remaining is None and "usedPercent" in d:
+            used = normalize_fraction(d.get("usedPercent"), already_percent=True)
+            if used is not None:
+                remaining = 1.0 - used
+
+        if remaining is not None:
+            out.append((label, remaining, reset))
+    return out
+
+
+def candidate_agy_cache_files() -> list[pathlib.Path]:
+    paths: list[pathlib.Path] = []
+    paths.extend(omarchy_usage_candidates(["agy", "antigravity", "gemini"]))
+    paths.append(HOME / ".gemini" / "antigravity-cli" / "usage-limits.json")
+
+    # Best-effort discovery for third-party Omarchy quota widgets. Only inspect
+    # small JSON files whose names look relevant; never inspect token/auth files.
+    for root in [HOME / ".local" / "state" / "omarchy", HOME / ".cache" / "omarchy"]:
+        if not root.is_dir():
+            continue
+        try:
+            for p in root.rglob("*.json"):
+                name = p.name.lower()
+                full = str(p).lower()
+                if not any(word in name or word in full for word in ("gemini", "antigravity", "agy", "quota", "usage")):
+                    continue
+                if any(secret in name or secret in full for secret in ("oauth", "token", "credential", "auth")):
+                    continue
+                try:
+                    if p.stat().st_size <= 2_000_000:
+                        paths.append(p)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    # Preserve order while removing duplicates.
+    seen: set[str] = set()
+    uniq: list[pathlib.Path] = []
+    for p in paths:
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            uniq.append(p)
+    return uniq
+
+
+def agy_quota() -> list[str]:
+    # First prefer the standard Omarchy usage-record shape.
+    for path in omarchy_usage_candidates(["agy", "antigravity", "gemini"]):
+        data = read_json(path)
+        parsed = parse_omarchy_limits(data)
+        if parsed:
+            tier, lines = parsed
+            out = []
+            if tier:
+                out.append(f"Plan: {tier}")
+            out.extend(lines[:3])
+            return out
+
+    # Then use compatible cache formats (including common agy usage tools).
+    best: tuple[str, float, str] | None = None
+    for path in candidate_agy_cache_files():
+        data = read_json(path)
+        if data is None:
+            continue
+        for candidate in generic_remaining_candidates(data):
+            if best is None or candidate[1] < best[1]:
+                best = candidate
+    if best:
+        label, remaining, reset = best
+        line = f"Quota: {round(remaining * 100)}% frei"
+        if label and label.lower() not in ("quota", "limit"):
+            line += f" · {label}"
+        if reset:
+            line += f" · Reset {reset}"
+        return [line]
+
+    return ["Quota: kein kompatibler lokaler Agy-Usage-Cache gefunden", "In Agy: /usage"]
+
+
+# ---------------------------------------------------------------------------
+# Sessions list (only with --sessions, i.e. when the menu opens; never in the
+# 60 s status timer). Reads metadata files, /proc and `hyprctl clients` once.
+SESSION_DAYS = 14
+SESSION_LIMIT = 6
+# Automatische Claude-Titel ohne Aussage (Sitzung begann mit einem Bild o. Ae.)
+GENERIC_TITLES = {"image attachment", "image", "screenshot", "untitled", "new session"}
+SAFE_ID = re.compile(r"^[A-Za-z0-9-]{8,80}$")
+
+
+def short_path(path: str) -> str:
+    home = str(HOME)
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+
+
+def window_pids() -> set[int]:
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=3).stdout
+        return {int(c["pid"]) for c in json.loads(out) if c.get("pid")}
+    except (OSError, ValueError, subprocess.SubprocessError, KeyError, TypeError):
+        return set()
+
+
+def parent_pid(pid: int) -> int:
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def window_for(pid: int, windows: set[int]) -> int:
+    for _ in range(8):
+        if pid <= 1:
+            return 0
+        if pid in windows:
+            return pid
+        pid = parent_pid(pid)
+    return 0
+
+
+def tail_title(path: pathlib.Path, keys: tuple[str, ...]) -> str:
+    """Last title-like entry of a Claude transcript (ai-title/custom-title)."""
+    title = ""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"custom-title"' not in line and '"ai-title"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                for k in keys:
+                    if obj.get(k):
+                        title = str(obj[k])
+    except OSError:
+        pass
+    return title
+
+
+def first_user_text(path: pathlib.Path, limit: int = 60) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for _ in range(2000):
+                line = fh.readline()
+                if not line:
+                    break
+                if '"type":"user"' not in line:
+                    continue
+                obj = json.loads(line)
+                content = (obj.get("message") or {}).get("content")
+                if isinstance(content, list):
+                    content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+                text = re.sub(r"\[(Image|Pasted text)[ :#][^\]]*\]", " ", str(content or ""))
+                text = re.sub(r"\s+", " ", text).strip()
+                if len(text) >= 8 and not text.startswith("<"):  # "ok", "1", "ja" sagen nichts
+                    return text[:limit]
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def launch(cwd: str, command: str) -> str:
+    return f"cd {shlex.quote(cwd)} && omarchy-launch-tui --app-id=org.omarchy.agent {command}"
+
+
+def claude_sessions(windows: set[int], since: float) -> list[dict]:
+    config_dir = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude")).expanduser()
+    active: dict[str, dict] = {}
+    for f in (config_dir / "sessions").glob("*.json"):
+        d = read_json(f)
+        if not isinstance(d, dict) or not d.get("sessionId") or d.get("kind") != "interactive":
+            continue
+        pid = int(d.get("pid") or 0)
+        if pid and pathlib.Path(f"/proc/{pid}").exists():
+            active[str(d["sessionId"])] = d
+    out = []
+    try:
+        files = [(p.stat().st_mtime, p) for p in (config_dir / "projects").glob("*/*.jsonl")]
+    except OSError:
+        files = []
+    files.sort(reverse=True)
+    seen = set()
+    for mtime, path in files[:40]:
+        sid = path.stem
+        if not SAFE_ID.match(sid) or (mtime < since and sid not in active):
+            continue
+        meta = active.get(sid, {})
+        cwd = str(meta.get("cwd") or "")
+        if not cwd:
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    for _ in range(30):
+                        line = fh.readline()
+                        if not line:
+                            break
+                        cwd = str(json.loads(line).get("cwd") or "")
+                        if cwd:
+                            break
+            except (OSError, ValueError):
+                pass
+        if not cwd or cwd.startswith("/tmp/") or not pathlib.Path(cwd).is_dir():
+            continue
+        title = tail_title(path, ("customTitle", "aiTitle"))
+        if not title or title.lower() in GENERIC_TITLES:
+            title = first_user_text(path) or title or str(meta.get("name") or sid[:8])
+        item = {"agent": "claude", "label": "Claude", "id": sid, "title": title, "cwd": short_path(cwd),
+                "updated": mtime, "active": sid in active, "status": str(meta.get("status") or ""),
+                "command": launch(cwd, f"claude --resume {sid}"), "focusPid": 0}
+        if item["active"]:
+            item["focusPid"] = window_for(int(meta.get("pid") or 0), windows)
+        out.append(item)
+        seen.add(sid)
+    return out
+
+
+def codex_sessions(windows: set[int], since: float) -> list[dict]:
+    names: dict[str, str] = {}
+    try:
+        with (HOME / ".codex" / "session_index.jsonl").open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                    names[str(obj["id"])] = str(obj.get("thread_name") or "")
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    # Running TUIs: rollout file held open by a codex process.
+    open_by: dict[str, int] = {}
+    for proc in pathlib.Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if (proc / "comm").read_text().strip() != "codex":
+                continue
+            for fd in (proc / "fd").iterdir():
+                target = os.readlink(fd)
+                if "/rollout-" in target and target.endswith(".jsonl"):
+                    open_by[target] = int(proc.name)
+        except OSError:
+            continue
+    try:
+        files = [(p.stat().st_mtime, p) for p in (HOME / ".codex" / "sessions").glob("*/*/*/rollout-*.jsonl")]
+    except OSError:
+        files = []
+    files.sort(reverse=True)
+    out = []
+    for mtime, path in files[:40]:
+        pid = open_by.get(str(path), 0)
+        if mtime < since and not pid:
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                meta = (json.loads(fh.readline()) or {}).get("payload") or {}
+        except (OSError, ValueError):
+            continue
+        sid, cwd = str(meta.get("id") or ""), str(meta.get("cwd") or "")
+        if not SAFE_ID.match(sid) or meta.get("thread_source", "user") != "user":
+            continue  # interne Laeufe (z. B. Guardian review) auslassen
+        if not cwd or cwd.startswith("/tmp/") or not pathlib.Path(cwd).is_dir():
+            continue
+        out.append({"agent": "codex", "label": "Codex", "id": sid, "title": names.get(sid) or sid[:8],
+                    "cwd": short_path(cwd), "updated": mtime, "active": bool(pid), "status": "",
+                    "command": launch(cwd, f"codex resume {sid}"),
+                    "focusPid": window_for(pid, windows) if pid else 0})
+    return out
+
+
+def agy_sessions(since: float) -> list[dict]:
+    data = read_json(HOME / ".gemini" / "antigravity-cli" / "cache" / "conversation_metadata.json")
+    convs = (data or {}).get("conversations") if isinstance(data, dict) else None
+    out = []
+    for cid, entry in (convs or {}).items():
+        summ = (entry or {}).get("summary") or {}
+        if (entry or {}).get("is_internal") or not SAFE_ID.match(str(cid)):
+            continue
+        try:
+            updated = datetime.fromisoformat(str(summ.get("UpdatedAt", "")).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        uris = summ.get("WorkspaceURIs") or []
+        cwd = str(uris[0])[7:] if uris and str(uris[0]).startswith("file://") else ""
+        if updated < since or not cwd or cwd.startswith("/tmp") or not pathlib.Path(cwd).is_dir():
+            continue
+        out.append({"agent": "agy", "label": "Agy", "id": str(cid),
+                    "title": str(summ.get("Title") or summ.get("Preview") or cid[:8]),
+                    "cwd": short_path(cwd), "updated": updated, "active": False, "status": "",
+                    "command": launch(cwd, f"agy --conversation {cid}"), "focusPid": 0})
+    return out
+
+
+def fmt_age(ts: float) -> str:
+    mins = int((time.time() - ts) / 60)
+    if mins < 1:
+        return "gerade eben"
+    if mins < 60:
+        return f"vor {mins} min"
+    if mins < 24 * 60:
+        return f"vor {mins // 60} h"
+    return f"vor {mins // 1440} T"
+
+
+def sessions() -> list[dict]:
+    since = time.time() - SESSION_DAYS * 86400
+    windows = window_pids()
+    items: list[dict] = []
+    for fn in (lambda: claude_sessions(windows, since), lambda: codex_sessions(windows, since), lambda: agy_sessions(since)):
+        try:
+            items.extend(fn())
+        except Exception:  # eine kaputte Quelle soll die anderen nicht verhindern
+            continue
+    items.sort(key=lambda i: (not i["active"], -i["updated"]))
+    per_agent: dict[str, int] = {}
+    kept = []
+    for i in items:  # hoechstens SESSION_LIMIT je Agent (Unterpunkte im Menue)
+        per_agent[i["agent"]] = per_agent.get(i["agent"], 0) + 1
+        if per_agent[i["agent"]] <= SESSION_LIMIT:
+            kept.append(i)
+    items = kept
+    for i in items:
+        i["title"] = re.sub(r"\s+", " ", i["title"]).strip()[:48]
+    # Gleich lautende Titel desselben Agenten unterscheidbar machen
+    counts: dict[tuple[str, str], int] = {}
+    for i in items:
+        counts[(i["agent"], i["title"])] = counts.get((i["agent"], i["title"]), 0) + 1
+    for i in items:
+        if counts[(i["agent"], i["title"])] > 1:
+            i["title"] = f"{i['title'][:40]} ({i['id'][:6]})"
+    for i in items:
+        state = {"busy": "arbeitet", "idle": "wartet"}.get(i["status"], "läuft") if i["active"] else fmt_age(i["updated"])
+        i["detail"] = f"{state} · {i['cwd']}"
+    return items
+
+
+def tooltip(name: str, resumable: bool, quota_lines: list[str]) -> str:
+    lines = [name, f"Session in ~/Work: {'resume verfügbar' if resumable else 'keine gespeicherte Session erkannt'}"]
+    lines.extend(quota_lines)
+    return "\n".join(lines)
+
+
+def main() -> int:
+    if "--sessions" in sys.argv[1:]:
+        print(json.dumps({"sessions": sessions()}, ensure_ascii=False))
+        return 0
+    c_resume = codex_resumable()
+    a_resume = agy_resumable()
+    cl_resume = claude_resumable()
+    result = {
+        "codex": {
+            "resumable": c_resume,
+            "tooltip": tooltip("Codex", c_resume, codex_quota()),
+        },
+        "agy": {
+            "resumable": a_resume,
+            "tooltip": tooltip("Agy / Antigravity", a_resume, agy_quota()),
+        },
+        "claude": {
+            "resumable": cl_resume,
+            "tooltip": tooltip("Claude Code", cl_resume, claude_quota()),
+        },
+    }
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
