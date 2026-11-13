@@ -82,10 +82,22 @@ Item {
             return
         // Running session: bring its window to the front instead of starting
         // a second client on the same transcript.
+        // Hyprland >= 0.56 erwartet Lua-Ausdruecke (die alte Form
+        // "focuswindow pid:N" scheitert dort mit einem Syntaxfehler).
         if (item.active && item.focusPid > 0)
-            bar.run("hyprctl dispatch focuswindow pid:" + Number(item.focusPid))
+            bar.run("hyprctl dispatch 'hl.dsp.focus({ window = \"pid:" + Math.floor(Number(item.focusPid)) + "\" })'")
         else if (item.command)
             bar.run(String(item.command))
+    }
+
+    // "Alle Sitzungen …": eigenes schwebendes Fenster mit Agentenwahl, Suche, Vorschau,
+    // Inhaltssuche und Abzweig (bin/agent-sessions, Idee und Grundlage von
+    // bernhard2804). Die App-ID TUI.float laesst Omarchy von sich aus schweben.
+    function openBrowser() {
+        menuOpen = false
+        expandedAgent = ""
+        if (bar)
+            bar.run("omarchy-launch-tui --app-id=TUI.float '" + pluginDir + "/bin/agent-sessions'")
     }
 
     function refreshSessions() {
@@ -277,7 +289,9 @@ Item {
                     { "label": "Codex fortsetzen", "agent": "codex", "resume": true },
                     { "separator": true },
                     { "label": "Agy", "agent": "agy", "resume": false },
-                    { "label": "Agy fortsetzen", "agent": "agy", "resume": true }
+                    { "label": "Agy fortsetzen", "agent": "agy", "resume": true },
+                    { "separator": true },
+                    { "label": "Alle Sitzungen …", "browse": true }
                 ]
 
                 delegate: Column {
@@ -346,7 +360,9 @@ Item {
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
-                                if (menuRow.isResume)
+                                if (menuRow.modelData.browse === true)
+                                    root.openBrowser()
+                                else if (menuRow.isResume)
                                     root.expandedAgent = menuRow.expanded ? "" : menuRow.modelData.agent
                                 else
                                     root.launchAgent(menuRow.modelData.agent, false)
@@ -386,6 +402,7 @@ Item {
                                 anchors.top: parent.top
                                 anchors.topMargin: subRow.isLast || subRow.isEmpty ? Style.space(6) : Style.space(3)
                                 elide: Text.ElideRight
+                                textFormat: Text.PlainText  // Titel = Modellausgabe, nie als Rich Text deuten
                                 text: subRow.isLast ? "Letzte Sitzung in ~/Work"
                                     : subRow.isEmpty ? "keine weiteren Sitzungen (14 Tage)"
                                     : (subRow.modelData.active ? "● " : "") + String(subRow.modelData.title || "")
@@ -401,6 +418,7 @@ Item {
                                 anchors.right: subTitle.right
                                 anchors.top: subTitle.bottom
                                 elide: Text.ElideRight
+                                textFormat: Text.PlainText
                                 text: String(subRow.modelData.detail || "")
                                 color: root.foreground
                                 opacity: 0.55

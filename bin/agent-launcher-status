@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import unquote
 from typing import Any, Iterable
 
 HOME = pathlib.Path.home()
@@ -321,7 +322,7 @@ SESSION_DAYS = 14
 SESSION_LIMIT = 6
 # Automatische Claude-Titel ohne Aussage (Sitzung begann mit einem Bild o. Ae.)
 GENERIC_TITLES = {"image attachment", "image", "screenshot", "untitled", "new session"}
-SAFE_ID = re.compile(r"^[A-Za-z0-9-]{8,80}$")
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{7,79}")  # nur mit fullmatch: kein fuehrendes "-", kein "\n"
 
 
 def short_path(path: str) -> str:
@@ -420,7 +421,7 @@ def claude_sessions(windows: set[int], since: float) -> list[dict]:
     seen = set()
     for mtime, path in files[:40]:
         sid = path.stem
-        if not SAFE_ID.match(sid) or (mtime < since and sid not in active):
+        if not SAFE_ID.fullmatch(sid) or (mtime < since and sid not in active):
             continue
         meta = active.get(sid, {})
         cwd = str(meta.get("cwd") or "")
@@ -451,7 +452,7 @@ def claude_sessions(windows: set[int], since: float) -> list[dict]:
     return out
 
 
-def codex_sessions(windows: set[int], since: float) -> list[dict]:
+def codex_sessions(windows: set[int], since: float, limit: int | None = 40) -> list[dict]:
     names: dict[str, str] = {}
     try:
         with (HOME / ".codex" / "session_index.jsonl").open("r", encoding="utf-8", errors="replace") as fh:
@@ -483,7 +484,7 @@ def codex_sessions(windows: set[int], since: float) -> list[dict]:
         files = []
     files.sort(reverse=True)
     out = []
-    for mtime, path in files[:40]:
+    for mtime, path in files[:limit]:
         pid = open_by.get(str(path), 0)
         if mtime < since and not pid:
             continue
@@ -493,12 +494,12 @@ def codex_sessions(windows: set[int], since: float) -> list[dict]:
         except (OSError, ValueError):
             continue
         sid, cwd = str(meta.get("id") or ""), str(meta.get("cwd") or "")
-        if not SAFE_ID.match(sid) or meta.get("thread_source", "user") != "user":
+        if not SAFE_ID.fullmatch(sid) or meta.get("thread_source", "user") != "user":
             continue  # interne Laeufe (z. B. Guardian review) auslassen
         if not cwd or cwd.startswith("/tmp/") or not pathlib.Path(cwd).is_dir():
             continue
         out.append({"agent": "codex", "label": "Codex", "id": sid, "title": names.get(sid) or sid[:8],
-                    "cwd": short_path(cwd), "updated": mtime, "active": bool(pid), "status": "",
+                    "cwd": short_path(cwd), "path": cwd, "updated": mtime, "active": bool(pid), "status": "",
                     "command": launch(cwd, f"codex resume {sid}"),
                     "focusPid": window_for(pid, windows) if pid else 0})
     return out
@@ -510,19 +511,19 @@ def agy_sessions(since: float) -> list[dict]:
     out = []
     for cid, entry in (convs or {}).items():
         summ = (entry or {}).get("summary") or {}
-        if (entry or {}).get("is_internal") or not SAFE_ID.match(str(cid)):
+        if (entry or {}).get("is_internal") or not SAFE_ID.fullmatch(str(cid)):
             continue
         try:
             updated = datetime.fromisoformat(str(summ.get("UpdatedAt", "")).replace("Z", "+00:00")).timestamp()
         except ValueError:
             continue
         uris = summ.get("WorkspaceURIs") or []
-        cwd = str(uris[0])[7:] if uris and str(uris[0]).startswith("file://") else ""
+        cwd = unquote(str(uris[0])[7:]) if uris and str(uris[0]).startswith("file://") else ""
         if updated < since or not cwd or cwd.startswith("/tmp") or not pathlib.Path(cwd).is_dir():
             continue
         out.append({"agent": "agy", "label": "Agy", "id": str(cid),
                     "title": str(summ.get("Title") or summ.get("Preview") or cid[:8]),
-                    "cwd": short_path(cwd), "updated": updated, "active": False, "status": "",
+                    "cwd": short_path(cwd), "path": cwd, "updated": updated, "active": False, "status": "",
                     "command": launch(cwd, f"agy --conversation {cid}"), "focusPid": 0})
     return out
 

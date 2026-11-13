@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""agent-sessions: Ueberblick ueber alle frueheren Agenten-Sitzungen.
+
+Urspruenglich von bernhard2804 als Experiment "claude-sitzungen" vorgeschlagen
+(mstio/polaris-connector#3); hier als Fenster "Alle Sitzungen ..." des
+Agenten-Starters (Menue bleibt schlank, volle Funktion im eigenen Fenster).
+
+Zeigt alle lokalen Sitzungen von Claude Code, Codex und Agy wie die
+Seitenleiste von Claude Chat: neueste oben, Agentenwahl oben im Rahmen
+(Tab/Shift+Tab). Fuer Claude zusaetzlich Vorschau, Inhaltssuche und Abzweig
+(claude --resume --fork-session). Enter setzt eine Sitzung in einem neuen
+Terminalfenster fort. Terminal-Oberflaeche mit fzf.
+
+Aufruf:
+  agent-sessions                             Uebersicht
+  agent-sessions --liste [--agent A]         Zeilen fuer fzf (SCHLUESSEL<TAB>Anzeige)
+  agent-sessions --liste --inhalt TEXT       Claude-Inhaltssuche
+  agent-sessions --wechsel 1|-1|0            fzf-transform: Agentenwahl
+  agent-sessions --vorschau ID               Vorschau einer Sitzung
+  agent-sessions --oeffnen ID [--abzweig]    Sitzung in neuem Fenster oeffnen
+
+Liest nur: $CLAUDE_CONFIG_DIR (Standard ~/.claude) projects/*/*.jsonl und
+sessions/*.json; Codex/Agy ueber bin/agent-launcher-status. Zwischenspeicher
+$XDG_CACHE_HOME/agent-sessions/index.json (wegwerfbar, nur fuer den Nutzer
+lesbar: enthaelt Gespraechsauszuege). Kein Hintergrunddienst, kein Timer, kein Netz.
+Abhaengigkeiten: python3, fzf; optional rg (schnellere Inhaltssuche),
+hyprctl (Fokus auf schon offene Sitzung), uwsm-app + xdg-terminal-exec (Omarchy).
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta
+
+HOME = os.path.expanduser("~")
+BASIS = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+PROJ = os.path.join(BASIS, "projects")
+REG = os.path.join(BASIS, "sessions")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"),
+                     "agent-sessions", "index.json")
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+SELF = os.path.abspath(__file__)
+VERSION = 2
+WOCHENTAG = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+# Von einer laufenden Claude-Sitzung gesetzt (nicht vom Nutzer): sonst gilt die
+# neue Sitzung als Kind und speichert u. a. ihren Verlauf nicht. Eigene
+# Einstellungen wie CLAUDE_CODE_USE_BEDROCK bleiben erhalten.
+LAUFZEIT_VARS = {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+                 "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SSE_PORT",
+                 "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_BRIDGE_SESSION_ID",
+                 "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"}
+
+# Steuerzeichen (auch ESC, C1 und Bidi-Steuerung) entfernen: Titel und Texte
+# sind Fremdinhalt (Modellausgaben, eingefuegte Texte) und duerfen das
+# Terminal nicht steuern.
+CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\ufeff\u202a-\u202e\u2066-\u2069]")
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+TYPEN = ('"type":"user"', '"type":"assistant"', '"type":"ai-title"',
+         '"type":"custom-title"', '"type":"last-prompt"')
+
+
+AGENTEN = ["alle", "claude", "codex", "agy"]
+NAME = {"alle": "Alle", "claude": "Claude", "codex": "Codex", "agy": "Agy"}
+
+
+def _lade_status():
+    """Codex/Agy liest bin/agent-launcher-status (dieselbe Logik wie das Menue)."""
+    sys.dont_write_bytecode = True  # kein __pycache__ im Plugin-Ordner
+    try:
+        from importlib.machinery import SourceFileLoader
+        from importlib.util import module_from_spec, spec_from_loader
+        loader = SourceFileLoader("agent_launcher_status",
+                                  os.path.join(os.path.dirname(SELF), "agent-launcher-status"))
+        mod = module_from_spec(spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+STATUS = _lade_status()
+
+
+def sauber(s, einzeilig=True):
+    s = CTRL.sub("", s or "")
+    if einzeilig:
+        s = " ".join(s.split())
+    return s.strip()
+
+
+def kurz(s, n):
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def text_aus(msg):
+    """Echter Text aus message.content (ohne Werkzeug-Ergebnisse und system-reminder)."""
+    if not isinstance(msg, dict):
+        return ""
+    c = msg.get("content")
+    if isinstance(c, str):
+        teile = [c]
+    elif isinstance(c, list):
+        teile = [_str(b.get("text")) for b in c if isinstance(b, dict) and b.get("type") == "text"]
+    else:
+        return ""
+    return REMINDER.sub("", "\n".join(teile)).strip()
+
+
+def ist_eingabe(t):
+    """Vom Menschen getippte Eingabe, keine Slash-Befehl-Protokolle o. Ae."""
+    return bool(t) and not t.startswith(("<command-", "<local-command", "<task-notification",
+                                          "Caveat:", "[Request interrupted"))
+
+
+def zeitstempel(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _str(v):
+    return v if isinstance(v, str) else ""
+
+
+def auswerten(pfad):
+    d = {"titel": "", "eigener_titel": "", "cwd": "", "erste": "", "letzte": "",
+         "fragen": 0, "beginn": None, "ende": None}
+    letzte_eigen = ""
+    with open(pfad, encoding="utf-8", errors="replace") as f:
+        for zeile in f:
+            if not any(t in zeile for t in TYPEN):
+                continue  # billiger Vorfilter, json.loads nur fuer relevante Zeilen
+            try:
+                r = json.loads(zeile)
+            except Exception:
+                continue
+            if not isinstance(r, dict):
+                continue  # Format ist undokumentiert: Unerwartetes ueberspringen
+            typ = r.get("type")
+            if typ == "ai-title":
+                d["titel"] = _str(r.get("aiTitle")) or d["titel"]
+            elif typ == "custom-title":
+                d["eigener_titel"] = _str(r.get("customTitle")) or d["eigener_titel"]
+            elif typ == "last-prompt":
+                d["letzte"] = _str(r.get("lastPrompt"))[:2000] or d["letzte"]
+            elif typ in ("user", "assistant"):
+                if r.get("isSidechain"):
+                    continue
+                ts = zeitstempel(r.get("timestamp", ""))
+                if ts:
+                    d["beginn"] = d["beginn"] or ts
+                    d["ende"] = ts
+                if not d["cwd"] and isinstance(r.get("cwd"), str):
+                    d["cwd"] = r["cwd"]
+                if typ == "user" and not r.get("isMeta"):
+                    t = text_aus(r.get("message"))
+                    if ist_eingabe(t):
+                        d["fragen"] += 1
+                        d["erste"] = d["erste"] or t[:2000]
+                        letzte_eigen = t[:2000]
+    if letzte_eigen:
+        d["letzte"] = letzte_eigen
+    return d
+
+
+def ordner_zulaessig(cwd):
+    """Positivliste: vorhandener Ordner im eigenen Home, ohne '..'."""
+    return bool(cwd) and (cwd == HOME or cwd.startswith(HOME + "/")) \
+        and ".." not in cwd.split("/") and os.path.isdir(cwd)
+
+
+def index():
+    try:
+        with open(CACHE) as f:
+            alt = json.load(f)
+        alt_e = alt.get("e", {}) if alt.get("v") == VERSION else {}
+    except Exception:
+        alt_e = {}
+    neu = {}
+    for pfad in glob.glob(os.path.join(PROJ, "*", "*.jsonl")):
+        sid = os.path.basename(pfad)[:-6]
+        if not UUID.match(sid):
+            continue
+        try:
+            st = os.stat(pfad)
+        except OSError:
+            continue
+        schluessel = f"{st.st_mtime_ns}:{st.st_size}"
+        e = alt_e.get(pfad)
+        if not e or e.get("k") != schluessel:
+            try:
+                e = auswerten(pfad)
+            except Exception:
+                continue  # eine kaputte Datei soll die Liste nicht leeren
+            e["k"] = schluessel
+        e["id"] = sid
+        neu[pfad] = e
+    try:
+        # Nur fuer den Nutzer lesbar: der Index enthaelt Gespraechsauszuege
+        # (die Verlaufsdateien selbst sind 0600).
+        os.makedirs(os.path.dirname(CACHE), mode=0o700, exist_ok=True)
+        tmp = CACHE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            json.dump({"v": VERSION, "e": neu}, f)
+        os.replace(tmp, CACHE)
+    except OSError:
+        pass
+    # Nur Sitzungen mit eigener Eingabe, deren Ordner noch existiert: Andere
+    # lassen sich nicht fortsetzen (z. B. Agenten in temporaeren Ordnern).
+    return [e for e in neu.values() if e.get("fragen") and e.get("ende") and ordner_zulaessig(e.get("cwd"))]
+
+
+def offene():
+    """Sitzungs-IDs, die gerade in einem laufenden Claude-Prozess offen sind -> PID."""
+    r = {}
+    for f in glob.glob(os.path.join(REG, "*.json")):
+        try:
+            with open(f) as h:
+                j = json.load(h)
+            pid = int(j.get("pid"))
+            if j.get("kind") != "interactive" or not UUID.match(j.get("sessionId", "")):
+                continue
+            os.kill(pid, 0)
+            exe = os.readlink(f"/proc/{pid}/exe")
+            if "claude" not in exe:
+                # npm-Installation: exe ist node, claude steht in der Befehlszeile
+                with open(f"/proc/{pid}/cmdline", "rb") as h:
+                    if b"claude" not in h.read():
+                        continue  # PID wiederverwendet
+            r[j["sessionId"]] = pid
+        except Exception:
+            continue
+    return r
+
+
+def ordner_kurz(cwd):
+    if cwd == HOME:
+        return "~"
+    return "~" + cwd[len(HOME):] if cwd.startswith(HOME + "/") else cwd
+
+
+def tag(ts):
+    dt = datetime.fromtimestamp(ts)
+    heute = date.today()
+    if dt.date() == heute:
+        return "Heute     " + dt.strftime("%H:%M")
+    if dt.date() == heute - timedelta(days=1):
+        return "Gestern   " + dt.strftime("%H:%M")
+    if (heute - dt.date()).days < 7:
+        return f"{WOCHENTAG[dt.weekday()]} {dt.strftime('%d.%m.')} " + dt.strftime("%H:%M")
+    return dt.strftime("%d.%m.%y  %H:%M")
+
+
+def titel(e):
+    return sauber(e.get("eigener_titel") or e.get("titel") or e.get("erste") or "(ohne Titel)")
+
+
+def andere(agent):
+    """Codex- bzw. Agy-Sitzungen (alle, ohne Zeitgrenze) aus agent-launcher-status."""
+    if STATUS is None:
+        return []
+    try:
+        if agent == "codex":
+            items = STATUS.codex_sessions(STATUS.window_pids(), 0, limit=None)
+        else:
+            items = STATUS.agy_sessions(0)
+    except Exception:
+        return []
+    return [i for i in items if isinstance(i, dict) and STATUS.SAFE_ID.fullmatch(str(i.get("id", "")))
+            and ordner_zulaessig(str(i.get("path", "")))]
+
+
+def _claude_zeile(e, auf):
+    return {"key": e["id"], "agent": "claude", "ende": e["ende"], "titel": titel(e),
+            "cwd": e["cwd"], "aktiv": e["id"] in auf}
+
+
+def _andere_zeile(i):
+    return {"key": f"{i['agent']}:{i['id']}", "agent": i["agent"], "ende": float(i.get("updated") or 0),
+            "titel": sauber(str(i.get("title") or "")) or "(ohne Titel)", "cwd": str(i["path"]),
+            "aktiv": bool(i.get("active"))}
+
+
+def _formatieren(zeilen_, treffer=None, mit_agent=False):
+    """Haupt-Ordner (haeufigster) wird nicht angezeigt, andere grau dahinter."""
+    zeilen_.sort(key=lambda r: r["ende"], reverse=True)
+    haupt = None
+    if zeilen_:
+        zaehler = {}
+        for r in zeilen_:
+            zaehler[r["cwd"]] = zaehler.get(r["cwd"], 0) + 1
+        haupt = max(zaehler, key=zaehler.get)
+    aus = []
+    for r in zeilen_:
+        mark = "●" if r["aktiv"] else " "
+        wer = f"\x1b[2m{NAME[r['agent']]:<7}\x1b[0m" if mit_agent else ""
+        extra = f"  [{treffer[r['key']]}×]" if treffer else ""
+        ordner = "" if r["cwd"] == haupt else f"  \x1b[2m{kurz(sauber(ordner_kurz(r['cwd'])), 30)}\x1b[0m"
+        aus.append(f"{r['key']}\t{tag(r['ende'])} {mark} {wer}{kurz(sauber(r['titel']), 60)}{extra}{ordner}")
+    return aus
+
+
+def zeilen(eintraege, treffer=None):
+    """Zeilen fuer Claude-Sitzungen (ID<TAB>Anzeige)."""
+    auf = offene()
+    return _formatieren([_claude_zeile(e, auf) for e in eintraege], treffer)
+
+
+def liste(agent="alle"):
+    """Zeilen fuer die gewaehlte Agenten-Ansicht, neueste oben."""
+    r = []
+    if agent in ("alle", "claude"):
+        auf = offene()
+        r += [_claude_zeile(e, auf) for e in index()]
+    for a in ("codex", "agy"):
+        if agent in ("alle", a):
+            r += [_andere_zeile(i) for i in andere(a)]
+    return _formatieren(r, mit_agent=(agent == "alle"))
+
+
+def rahmen(agent):
+    """Agentenwahl oben im Fensterrahmen; die gewaehlte ist invertiert."""
+    return " " + " ".join(f"\x1b[7m {NAME[a]} \x1b[0m" if a == agent else f" {NAME[a]} "
+                          for a in AGENTEN) + " "
+
+
+def aktueller_agent():
+    m = re.search(r"\x1b\[7m (\w+) ", os.environ.get("FZF_BORDER_LABEL", ""))
+    return next((a for a in AGENTEN if m and NAME[a] == m.group(1)), "alle")
+
+
+def wechsel(schritt):
+    """fzf-transform: naechste/vorige Agenten-Ansicht (Tab/Shift+Tab, 0 = neu laden)."""
+    a = AGENTEN[(AGENTEN.index(aktueller_agent()) + schritt) % len(AGENTEN)]
+    print(f"reload('{SELF}' --liste --agent {a})+change-prompt(Suche › )+clear-query"
+          f"+change-border-label:{rahmen(a)}")
+
+
+def inhaltssuche(q):
+    """Sucht im eigentlichen Gespraechstext (ohne system-reminder), nicht im Rohformat."""
+    q = sauber(q)
+    if not q:
+        return [], {}
+    alle = {e["id"]: e for e in index()}
+    # Die Verlaufsdateien sind JSON: " und \ stehen dort maskiert. Vorfilter
+    # daher mit der maskierten Form, gezaehlt wird im entpackten Text.
+    roh = json.dumps(q, ensure_ascii=False)[1:-1]
+    kandidaten = None
+    if shutil.which("rg"):
+        try:
+            kandidaten = subprocess.run(
+                ["rg", "-l", "-i", "-F", "--no-ignore", "--hidden", "--glob", "*.jsonl", "--max-depth", "2", "--", roh, PROJ],
+                capture_output=True, text=True, timeout=60).stdout.splitlines()
+        except Exception:
+            kandidaten = None
+    if kandidaten is None:
+        kandidaten = glob.glob(os.path.join(PROJ, "*", "*.jsonl"))
+    ql, rl = q.lower(), roh.lower()
+    treffer = {}
+    for pfad in kandidaten:
+        sid = os.path.basename(pfad)[:-6]
+        if sid not in alle:
+            continue
+        n = 0
+        try:
+            f = open(pfad, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with f:
+            for zeile in f:
+                if ('"type":"user"' not in zeile and '"type":"assistant"' not in zeile) or rl not in zeile.lower():
+                    continue
+                try:
+                    r = json.loads(zeile)
+                except Exception:
+                    continue
+                if isinstance(r, dict):
+                    n += text_aus(r.get("message")).lower().count(ql)
+        if n:
+            treffer[sid] = n
+    return [alle[s] for s in treffer], treffer
+
+
+def finde(sid):
+    if not UUID.match(sid or ""):
+        return None
+    for pfad in glob.glob(os.path.join(PROJ, "*", sid + ".jsonl")):
+        return pfad
+    return None
+
+
+def letzte_antwort(pfad):
+    """Letzte Textantwort von Claude; liest nur das Dateiende."""
+    with open(pfad, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 3_000_000))
+        rest = f.read().decode("utf-8", "replace").splitlines()
+    for zeile in reversed(rest):
+        if '"type":"assistant"' not in zeile:
+            continue
+        try:
+            r = json.loads(zeile)
+        except Exception:
+            continue
+        if isinstance(r, dict) and not r.get("isSidechain"):
+            t = text_aus(r.get("message"))
+            if t:
+                return t[:6000]
+    return ""
+
+
+def _andere_finden(schluessel):
+    agent, _, sid = (schluessel or "").partition(":")
+    if agent not in ("codex", "agy"):
+        return None
+    return next((i for i in andere(agent) if i["id"] == sid), None)
+
+
+def vorschau_andere(schluessel):
+    i = _andere_finden(schluessel)
+    if not i:
+        print("Sitzung nicht gefunden.")
+        return
+    B, D, N = "\x1b[1m", "\x1b[2m", "\x1b[0m"
+    print(B + sauber(str(i.get("title") or "(ohne Titel)")) + N)
+    print(f"{D}Agent:{N} {NAME[i['agent']]}   {D}Ordner:{N} {sauber(ordner_kurz(str(i['path'])))}")
+    print(f"{D}Zuletzt:{N} {datetime.fromtimestamp(float(i.get('updated') or 0)).strftime('%d.%m.%Y %H:%M')}")
+    if i.get("active"):
+        print("\x1b[33m● gerade in einem Fenster offen\x1b[0m")
+    print()
+    print(D + "Vorschau, Inhaltssuche und Abzweig gibt es bisher nur für Claude." + N)
+
+
+def vorschau(sid):
+    if ":" in (sid or ""):
+        return vorschau_andere(sid)
+    pfad = finde(sid)
+    if not pfad:
+        print("Sitzung nicht gefunden.")
+        return
+    e = auswerten(pfad)
+    B, D, N = "\x1b[1m", "\x1b[2m", "\x1b[0m"
+
+    def absatz(s, n):
+        z = [x[:2000] for x in sauber(s, einzeilig=False).splitlines()]  # Umbruch macht fzf (wrap-word)
+        return "\n".join(z[:n] + ([D + "…" + N] if len(z) > n else []))
+
+    print(B + titel(e) + N)
+    von = datetime.fromtimestamp(e["beginn"]).strftime("%d.%m.%Y %H:%M") if e["beginn"] else "?"
+    bis = datetime.fromtimestamp(e["ende"]).strftime("%d.%m.%Y %H:%M") if e["ende"] else "?"
+    print(f"{D}Ordner:{N} {sauber(ordner_kurz(e['cwd']))}   {D}Eingaben:{N} {e['fragen']}")
+    print(f"{D}Zeitraum:{N} {von} - {bis}")
+    if sid in offene():
+        print("\x1b[33m● gerade in einem Fenster offen\x1b[0m")
+    print()
+    print(B + "Erste Eingabe" + N)
+    print(absatz(e["erste"], 8))
+    if e["letzte"] and e["letzte"] != e["erste"]:
+        print()
+        print(B + "Letzte Eingabe" + N)
+        print(absatz(e["letzte"], 6))
+    a = letzte_antwort(pfad)
+    if a:
+        print()
+        print(B + "Letzte Antwort" + N)
+        print(absatz(a, 14))
+
+
+def melden(text, kritisch=False):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-u", "critical" if kritisch else "normal",
+                        "Agenten-Sitzungen", text], timeout=5, check=False)
+    else:
+        print(text, file=sys.stderr)
+
+
+def fenster_zu_pid(pid):
+    """Hyprland-Fenster, in dem der Claude-Prozess laeuft (Elternkette hoch)."""
+    if not shutil.which("hyprctl"):
+        return None
+    try:
+        clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True,
+                                            text=True, timeout=5).stdout)
+    except Exception:
+        return None
+    nach_pid = {c.get("pid"): c.get("address") for c in clients}
+    p = pid
+    for _ in range(30):
+        if p in nach_pid:
+            return nach_pid[p]
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                p = int(f.read().rsplit(")", 1)[1].split()[1])
+        except Exception:
+            return None
+        if p <= 1:
+            return None
+    return None
+
+
+def starten(befehl, cwd):
+    fehlt = [p for p in (befehl[0], "setsid", "xdg-terminal-exec") if not shutil.which(p)]
+    if fehlt:
+        melden("Nicht gefunden: " + ", ".join(fehlt), True)
+        return
+    # Aus einer Claude-Sitzung heraus gestartet, erbt der neue Prozess sonst
+    # CLAUDE_CODE_CHILD_SESSION u. Ae. und speichert seinen Verlauf nicht.
+    umg = {k: v for k, v in os.environ.items() if k not in LAUFZEIT_VARS}
+    terminal = ["xdg-terminal-exec", "--app-id=org.omarchy.agent", "-e"]
+    if shutil.which("uwsm-app"):
+        terminal = ["uwsm-app", "--"] + terminal
+    subprocess.Popen(["setsid", "-f"] + terminal + befehl, cwd=cwd, env=umg,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def oeffnen_andere(schluessel, abzweig=False):
+    i = _andere_finden(schluessel)
+    if not i:
+        melden("Sitzung nicht gefunden.", True)
+        return
+    if abzweig:
+        melden("Abzweig gibt es bisher nur für Claude.", True)
+        return
+    pid = int(i.get("focusPid") or 0)
+    if i.get("active"):
+        # Dieselbe Sitzung nicht zweimal fortsetzen.
+        if pid > 0 and shutil.which("hyprctl"):
+            subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "pid:{pid}" }})'],
+                           capture_output=True, timeout=5)
+        else:
+            melden("Diese Sitzung ist schon offen, ihr Fenster wurde nicht gefunden.", True)
+        return
+    befehl = ["codex", "resume", i["id"]] if i["agent"] == "codex" else ["agy", "--conversation", i["id"]]
+    starten(befehl, i["path"])
+
+
+def oeffnen(sid, abzweig=False):
+    if not sid:
+        return  # Enter auf leerer Liste
+    if ":" in sid:
+        return oeffnen_andere(sid, abzweig)
+    pfad = finde(sid)
+    if not pfad:
+        melden("Sitzung nicht gefunden.", True)
+        return
+    auf = offene()
+    if not abzweig and sid in auf:
+        # Dieselbe Sitzung nicht zweimal fortsetzen: Fenster nach vorn holen.
+        adr = fenster_zu_pid(auf[sid])
+        if adr and re.match(r"^0x[0-9a-f]+$", adr):
+            subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{adr}" }})'],
+                           capture_output=True)
+            return
+        melden("Diese Sitzung ist schon offen, ihr Fenster wurde nicht gefunden. "
+               "Mit Strg+F als Abzweig öffnen.", True)
+        return
+    cwd = auswerten(pfad)["cwd"]
+    if not ordner_zulaessig(cwd):
+        melden(f"Ordner der Sitzung fehlt oder ist unzulässig: {sauber(cwd)}", True)
+        return
+    starten(["claude", "--resume", sid] + (["--fork-session"] if abzweig else []), cwd)
+
+
+def oberflaeche():
+    if not shutil.which("fzf"):
+        print("fzf fehlt (pacman -S fzf).")
+        time.sleep(3)
+        return
+    me = SELF
+    kopf = ("Tab/Shift+Tab Agent · Enter fortsetzen · Strg+F Abzweig · Esc schließen\n"
+            "Strg+S im Gesprächsinhalt suchen (Claude) · Strg+R neu laden · ● = gerade offen")
+    args = [
+        "fzf", "--ansi", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--tiebreak=index",
+        "--layout=reverse", "--info=inline-right", "--header", kopf, "--header-first",
+        "--prompt", "Suche › ", "--border=rounded", "--border-label", rahmen("alle"),
+        "--preview", f"'{me}' --vorschau {{1}}", "--preview-window=down,50%,wrap-word,border-top",
+        "--bind", f"enter:execute-silent('{me}' --oeffnen {{1}})+abort",
+        "--bind", f"ctrl-f:execute-silent('{me}' --oeffnen {{1}} --abzweig)+abort",
+        "--bind", f"ctrl-s:reload('{me}' --liste --inhalt {{q}})"
+                  "+transform-prompt(printf 'Im Inhalt: %s › ' {q})+clear-query"
+                  f"+change-border-label:{rahmen('claude')}",
+        "--bind", f"tab:transform('{me}' --wechsel 1)",
+        "--bind", f"shift-tab:transform('{me}' --wechsel -1)",
+        "--bind", f"ctrl-r:transform('{me}' --wechsel 0)",
+    ]
+    subprocess.run(args, input="\n".join(liste("alle")) + "\n", text=True)
+
+
+def main(a):
+    if not a:
+        oberflaeche()
+    elif a[0] == "--liste":
+        if len(a) >= 3 and a[1] == "--inhalt":
+            e, t = inhaltssuche(" ".join(a[2:]))
+            print("\n".join(zeilen(e, t)))
+        elif len(a) == 3 and a[1] == "--agent" and a[2] in AGENTEN:
+            print("\n".join(liste(a[2])))
+        else:
+            print("\n".join(liste("alle")))
+    elif a[0] == "--wechsel" and len(a) == 2 and a[1] in ("1", "-1", "0"):
+        wechsel(int(a[1]))
+    elif a[0] == "--vorschau" and len(a) == 2:
+        vorschau(a[1])
+    elif a[0] == "--oeffnen" and len(a) in (2, 3):
+        oeffnen(a[1], abzweig=(len(a) == 3 and a[2] == "--abzweig"))
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

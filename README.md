@@ -21,10 +21,36 @@ Menu rows (all start in `~/Work`):
 
 Clicking **„… fortsetzen ▸“** expands that agent's sessions as sub-items (one agent at a time): first „Letzte Sitzung in ~/Work“ (the previous `--continue` behaviour), then its running and recent sessions (last 14 days, at most 6 per agent, running ones first, marked **●**), each with title, age or state (`arbeitet`/`wartet`) and working directory:
 
-- running session → its window is focused (`hyprctl dispatch focuswindow pid:<terminal>`), no second client on the same transcript
+- running session → its window is focused (`hyprctl dispatch 'hl.dsp.focus({ window = "pid:<terminal>" })'`, Hyprland ≥ 0.56 syntax), no second client on the same transcript
 - older session → resumed in its own directory: `claude --resume <id>`, `codex resume <id>`, `agy --conversation <id>`
 
 Sources (read-only, only when the menu opens, ~0.5 s): `~/.claude/sessions/*.json` (running Claude TUIs) and `~/.claude/projects/*/*.jsonl` (title from `ai-title`/`custom-title`), `~/.codex/session_index.jsonl` plus rollout headers (internal runs such as Guardian review are skipped; running = rollout file held open by a `codex` process), Antigravity `cache/conversation_metadata.json`. Sessions in `/tmp` (e.g. curator runs) are skipped.
+
+### All sessions (since 1.5.0)
+
+The last menu row **„Alle Sitzungen …“** opens a floating terminal window with *every* local session of Claude Code, Codex and Agy across all folders, like the sidebar in Claude Chat. The menu itself stays small. Idea and original Claude script by bernhard2804 (proposed as `claude-sitzungen` in mstio/polaris-connector#3).
+
+The agent choice sits at the top of the window frame: **Alle · Claude · Codex · Agy**.
+
+| Key | Effect |
+|---|---|
+| Tab / Shift+Tab | next / previous agent |
+| typing | filter titles (fzf) |
+| Enter | resume in a new terminal in the session's folder (`claude --resume`, `codex resume`, `agy --conversation`); if it is already open, focus its window instead |
+| Ctrl+F | Claude: fork for a follow-up question (`--resume --fork-session`), the original transcript stays unchanged |
+| Ctrl+S | Claude: search the typed text in the **conversation content** (hit count per session) |
+| Ctrl+R | reload the current view |
+| Esc | close |
+
+- Preview: for Claude folder, time span, number of prompts, first and last prompt, last answer; for Codex and Agy title, folder and last use (Agy stores its transcripts as binary data). **●** = open right now.
+- Script `bin/agent-sessions`, needs `python3` and `fzf` ≥ 0.74 (tested; uses `transform`, labels and `wrap-word`), optional `rg` for faster content search. Codex and Agy sessions come from `bin/agent-launcher-status` (same rules as the menu, without the 14-day limit). The script can also be run directly or bound to a key, e.g. in `~/.config/hypr/bindings.lua`:
+  `o.bind("SUPER + ALT + H", "Agenten-Sitzungen", "omarchy-launch-tui --app-id=TUI.float ~/.config/omarchy/plugins/mst.agent-launchers/bin/agent-sessions")`
+- The window uses the app id `TUI.float`, which Omarchy already floats and centers (875×600); no window rule needed.
+- Read-only on the agents' own session files; no network, no service, no timer. Lists only sessions whose folder still exists under `$HOME`; opens only a checked session id in such a folder, command as an argument list (no shell). Titles and texts are model output: control, C1, bidi and zero-width characters are stripped before display.
+- Index cache `~/.cache/agent-sessions/index.json` (mode 0600, it contains prompt excerpts), rebuilt per file by mtime and size: first build ~2 s for ~80 Claude sessions, then < 0.1 s.
+- "Open right now" for Claude comes from `~/.claude/sessions/*.json` (process checked via `/proc`, also for npm installs).
+- The transcript formats are undocumented and may change with agent updates; unexpected records are skipped instead of emptying the list.
+- Tests: `python3 -m unittest discover -s tests`.
 
 A small **•** on the icon means at least one agent has a resumable `~/Work` session; in the menu, resume rows with a detected session carry a **•**, the others are dimmed (still clickable).
 
