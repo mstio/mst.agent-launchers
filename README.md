@@ -6,7 +6,7 @@ One icon in the Omarchy bar for **Claude Code**, **Codex** and **Agy / Antigravi
 
 - **Launch and resume** each agent from a small context menu.
 - **Running and recent sessions** per agent, with title, state and folder. A session that is already open gets its window focused instead of a second client on the same transcript.
-- **All sessions …** opens a floating window with all sessions of all three agents (those whose folder still exists in your home): agent choice, filter, preview, search in the conversation content (Claude) and fork for a follow-up question (Claude).
+- **All sessions …** opens a floating window with all sessions of all three agents (those whose folder still exists in your home): agent choice, filter, preview, search in the conversation content, and fork for a follow-up question (Claude).
 - **Quota at a glance** in the tooltip, read from local usage records only.
 - English or German, following your system language.
 
@@ -72,11 +72,11 @@ The last menu row opens a floating terminal with all local sessions of all three
 | typing | filter titles |
 | Enter | resume in a new terminal in the session's folder; if it is already open, focus its window |
 | Ctrl+F | Claude: fork for a follow-up question (`--resume --fork-session`); the original transcript stays unchanged |
-| Ctrl+S | Claude: search the typed text in the conversation content, with hit count per session |
+| Ctrl+S | search the typed text in the conversation content of the current agent view (prompts and answers, not tool output), with hit count per session |
 | Ctrl+R | reload the current agent view (clears the filter and leaves the content search) |
 | Esc | close |
 
-- Preview for Claude: folder, period, number of prompts, first and last prompt, last answer. For Codex and Agy: title, folder and last use (Agy stores its transcripts as binary data).
+- Preview: folder, period, number of prompts, first and last prompt, last answer (Codex: its final answer, otherwise the last interim note). Agy keeps a readable transcript only for some conversations; for the others the preview shows title, folder and last use.
 - The window uses the app id `TUI.float`, which Omarchy already floats and centers; no window rule needed.
 - Own key binding (optional), e.g. in `~/.config/hypr/bindings.lua`:
 
@@ -107,9 +107,9 @@ The plugin never reads or prints OAuth tokens and never calls a quota API itself
 
 ## Privacy and safety
 
-- **Read-only** on the agents' own files: `~/.claude/projects/*/*.jsonl` and `~/.claude/sessions/*.json` (or `$CLAUDE_CONFIG_DIR`), `~/.codex/session_index.jsonl` and the first lines of `~/.codex/sessions/**/rollout-*.jsonl`, Agy's `cache/conversation_metadata.json` and `cache/last_conversations.json`, `/proc` (which agent process is running, which window it belongs to). Never the `.key` files next to them. For the quota: the usage files listed above and JSON files named after Agy (`*agy*`, `*antigravity*`, `*gemini*`, never `*token*`, `*auth*`) below `~/.local/state/omarchy` and `~/.cache/omarchy`.
+- **Read-only** on the agents' own files: `~/.claude/projects/*/*.jsonl` and `~/.claude/sessions/*.json` (or `$CLAUDE_CONFIG_DIR`), `~/.codex/session_index.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl` (first line for the list, the whole file for preview and content search), Agy's `cache/conversation_metadata.json`, `cache/last_conversations.json` and, for preview and content search, `brain/<id>/.system_generated/logs/transcript_full.jsonl` (or `transcript.jsonl`), `/proc` (which agent process is running, which window it belongs to). Never the `.key` files next to them. For the quota: the usage files listed above and JSON files named after Agy (`*agy*`, `*antigravity*`, `*gemini*`, never `*token*`, `*auth*`) below `~/.local/state/omarchy` and `~/.cache/omarchy`.
 - **No network, no service.** The status for the tooltip is refreshed from local files every 60 s; the session list only when you open the menu (~0.5 s) or the window.
-- **Index cache** `~/.cache/agent-sessions/index.json` for the window, mode 0600 because it contains prompt excerpts; it is rebuilt per file by mtime and size and can be deleted at any time.
+- **Index cache** `~/.cache/agent-sessions/index.json` for the window, mode 0600 because it contains prompt excerpts; it is rebuilt per file by mtime and size and can be deleted at any time. Codex and Agy are read directly, without a cache.
 - Titles and texts are model output: control, C1, bidi and zero-width space characters are stripped before display, and the menu renders them as plain text.
 - Resuming only uses a checked session id (letters, digits, dashes) in an existing folder: the window starts it as an argument list without a shell and only for folders below `$HOME`; the menu runs a shell line with the folder quoted (`shlex.quote`). Sessions in `/tmp` (e.g. automated runs) and internal Codex runs are skipped.
 - No automatic agent switching, no change of the Omarchy default agent, no `--dangerously-skip-permissions`.

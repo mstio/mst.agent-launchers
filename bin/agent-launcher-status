@@ -526,8 +526,8 @@ def codex_sessions(windows: set[int], since: float, limit: int | None = 40) -> l
         if not cwd or cwd.startswith("/tmp/") or not pathlib.Path(cwd).is_dir():
             continue
         out.append({"agent": "codex", "label": "Codex", "id": sid, "title": names.get(sid) or sid[:8],
-                    "cwd": short_path(cwd), "path": cwd, "updated": mtime, "active": bool(pid), "status": "",
-                    "command": launch(cwd, f"codex resume {sid}"),
+                    "cwd": short_path(cwd), "path": cwd, "file": str(path), "updated": mtime,
+                    "active": bool(pid), "status": "", "command": launch(cwd, f"codex resume {sid}"),
                     "focusPid": window_for(pid, windows) if pid else 0})
     return out
 

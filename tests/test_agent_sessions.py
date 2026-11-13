@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,12 +19,14 @@ ID_C = "33333333-3333-4333-8333-333333333333"
 ID_D = "44444444-4444-4444-8444-444444444444"
 ID_E = "55555555-5555-4555-8555-555555555555"
 ID_X = "01a1aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee"  # Codex
+ID_Y = "66666666-6666-4666-8666-666666666666"  # Agy
 
 
 def lade(home):
     """Skript als Modul laden; Pfade werden beim Import aus HOME/Umgebung gelesen."""
     env = {"HOME": home, "CLAUDE_CONFIG_DIR": os.path.join(home, ".claude"),
            "XDG_CACHE_HOME": os.path.join(home, ".cache")}
+    sys.dont_write_bytecode = True  # kein __pycache__ im Plugin-Ordner
     with mock.patch.dict(os.environ, env):
         loader = importlib.machinery.SourceFileLoader("agent_sessions", str(SCRIPT))
         spec = importlib.util.spec_from_loader("agent_sessions", loader)
@@ -78,8 +81,38 @@ class ClaudeSitzungenTest(unittest.TestCase):
         # Codex: Kopfzeile der rollout-Datei plus Titel aus session_index.jsonl
         cx = Path(self.home, ".codex", "sessions", "2026", "11", "01")
         cx.mkdir(parents=True)
-        (cx / f"rollout-2026-11-01T10-00-00-{ID_X}.jsonl").write_text(zeile(
-            type="session_meta", payload={"id": ID_X, "cwd": a, "thread_source": "user"}))
+        # zeile() maskiert Umlaute als \\uXXXX (ensure_ascii), wie Codex teils auch
+        (cx / f"rollout-2026-11-01T10-00-00-{ID_X}.jsonl").write_text(
+            zeile(timestamp="2026-11-01T10:00:00Z", type="session_meta",
+                  payload={"id": ID_X, "cwd": a, "thread_source": "user"})
+            + zeile(timestamp="2026-11-01T10:00:01Z", type="response_item",
+                    payload={"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": "<environment_context>Kunde-B"}]})
+            + zeile(timestamp="2026-11-01T10:00:02Z", type="event_msg",
+                    payload={"type": "item_completed", "item": {"type": "UserMessage", "content": [
+                        {"type": "text", "text": "Grüße an den Router?"}]}})
+            + zeile(timestamp="2026-11-01T10:00:03Z", type="event_msg",
+                    payload={"type": "item_completed", "item": {"type": "CommandExecution", "output": "router"}})
+            + zeile(timestamp="2026-11-01T10:05:00Z", type="event_msg",
+                    payload={"type": "item_completed", "item": {"type": "AgentMessage", "phase": "final_answer",
+                             "content": [{"type": "Text", "text": "Der Router grüßt zurück.\x1b]0;x\x07"}]}})
+            + zeile(timestamp="2026-11-01T10:06:00Z", type="event_msg",
+                    payload={"type": "item_completed", "item": {"type": "AgentMessage", "phase": "commentary",
+                             "content": [{"type": "Text", "text": "Ich prüfe noch den Router."}]}}))
+        # Agy: Metadaten plus Verlauf; nur <USER_REQUEST> und Antworten zaehlen
+        ag = Path(self.home, ".gemini", "antigravity-cli")
+        (ag / "cache").mkdir(parents=True)
+        (ag / "cache" / "conversation_metadata.json").write_text(json.dumps({"conversations": {ID_Y: {"summary": {
+            "Title": "Agy-Frage", "UpdatedAt": "2026-11-01T12:00:00Z", "WorkspaceURIs": ["file://" + a]}}}}))
+        lg = ag / "brain" / ID_Y / ".system_generated" / "logs"
+        lg.mkdir(parents=True)
+        (lg / "transcript_full.jsonl").write_text(
+            zeile(type="USER_INPUT", source="USER_EXPLICIT", created_at="2026-11-01T11:00:00Z",
+                  content="<USER_REQUEST>\nWo ist der Router?\n</USER_REQUEST>\n"
+                          "<ADDITIONAL_METADATA>Kunde-C</ADDITIONAL_METADATA>")
+            + zeile(type="GENERIC", source="MODEL", created_at="2026-11-01T11:00:05Z", content="router.log")
+            + zeile(type="PLANNER_RESPONSE", source="MODEL", created_at="2026-11-01T11:01:00Z",
+                    content="Im Keller.", tool_calls=[]))
         Path(self.home, ".codex", "session_index.jsonl").write_text(zeile(id=ID_X, thread_name="Codex-Frage"))
         self.m = lade(self.home)
         # Tests sollen nicht davon abhaengen, ob claude/codex/Terminal installiert sind.
@@ -102,7 +135,7 @@ class ClaudeSitzungenTest(unittest.TestCase):
         self.assertEqual(a["cwd"], self.arbeit)
 
     def test_steuerzeichen_im_titel_werden_entfernt(self):
-        z = self.m.zeilen(self.m.index())
+        z = self.m.liste("claude")
         self.assertEqual(len(z), 1)
         self.assertNotIn("\x1b]", z[0])
         self.assertNotIn("\x07", z[0])
@@ -119,7 +152,7 @@ class ClaudeSitzungenTest(unittest.TestCase):
         self.assertEqual(t, {})
         e, t = self.m.inhaltssuche("drucker")
         self.assertEqual(t, {ID_A: 2})  # Frage + Antwort, Titel zaehlt nicht
-        self.assertEqual([x["id"] for x in e], [ID_A])
+        self.assertEqual([x["key"] for x in e], [ID_A])
 
     def test_cache_nur_fuer_den_nutzer_lesbar(self):
         self.m.index()
@@ -161,13 +194,80 @@ class ClaudeSitzungenTest(unittest.TestCase):
 
     def test_agentenwahl_listet_codex_mit_agent_und_schluessel(self):
         alle = self.m.liste("alle")
-        self.assertEqual(len(alle), 2)
+        self.assertEqual(len(alle), 3)
         codex = [z for z in alle if z.startswith("codex:")]
         self.assertEqual(len(codex), 1)
         self.assertTrue(codex[0].startswith(f"codex:{ID_X}\t"))
         self.assertIn("Codex-Frage", codex[0])
         self.assertEqual([z.split("\t")[0] for z in self.m.liste("claude")], [ID_A])
-        self.assertEqual(self.m.liste("agy"), [])
+        self.assertEqual([z.split("\t")[0] for z in self.m.liste("agy")], ["agy:" + ID_Y])
+
+    def test_vorschau_codex_und_agy_aus_dem_verlauf(self):
+        for schluessel, erwartet, fehlt in (
+                ("codex:" + ID_X, ["Grüße an den Router?", "Der Router grüßt zurück.", "\x1b[0m 1\n"],
+                 ["Kunde-B", "\x1b]", "\x07", "Ich prüfe"]),
+                ("agy:" + ID_Y, ["Wo ist der Router?", "Im Keller.", "Agy-Frage"], ["Kunde-C", "USER_REQUEST"])):
+            with self.subTest(schluessel=schluessel), mock.patch("builtins.print") as p:
+                self.m.vorschau(schluessel)
+                aus = "\n".join(str(c[0][0]) if c[0] else "" for c in p.call_args_list)
+                for t in erwartet:
+                    self.assertIn(t, aus)
+                for t in fehlt:
+                    self.assertNotIn(t, aus)
+
+    def test_inhaltssuche_ueber_alle_agenten_und_maskierte_umlaute(self):
+        for rg in (True, False):  # mit und ohne ripgrep
+            with self.subTest(rg=rg), mock.patch.object(
+                    self.m.shutil, "which", side_effect=lambda b: None if b == "rg" and not rg else "/usr/bin/x"):
+                _, t = self.m.inhaltssuche("router")
+                self.assertEqual(t, {"codex:" + ID_X: 3, "agy:" + ID_Y: 1})  # Werkzeugausgaben zaehlen nicht
+                _, t = self.m.inhaltssuche("grü")
+                self.assertEqual(t, {"codex:" + ID_X: 2})
+                _, t = self.m.inhaltssuche("prüfe")  # Zwischenmeldung
+                self.assertEqual(t, {"codex:" + ID_X: 1})
+                _, t = self.m.inhaltssuche("Kunde")  # eingeschobener Kontext, Agy-Metadaten
+                self.assertEqual(t, {})
+                _, t = self.m.inhaltssuche("router", "agy")
+                self.assertEqual(t, {"agy:" + ID_Y: 1})
+                _, t = self.m.inhaltssuche("drucker", "codex")
+                self.assertEqual(t, {})
+
+    def test_codex_unerwartete_und_gemischte_datensaetze(self):
+        d = os.path.join(self.home, ".codex", "sessions", "2026", "11", "01", f"rollout-2026-11-01T10-00-00-{ID_X}.jsonl")
+        with open(d, "a") as f:
+            f.write(zeile(type="event_msg", payload={"type": "item_completed", "item": {"type": ["UserMessage"]}}))
+            # alte Form (fortgesetzte Sitzung): neue Frage zaehlt, Doppel nicht
+            f.write(zeile(type="event_msg", payload={"type": "user_message", "message": "Grüße an den Router?"}))
+            f.write(zeile(type="event_msg", payload={"type": "user_message", "message": "Alter Router-Teil"}))
+        _, t = self.m.inhaltssuche("router", "codex")
+        self.assertEqual(t, {"codex:" + ID_X: 4})
+        with mock.patch("builtins.print") as p:
+            self.m.vorschau("codex:" + ID_X)
+        aus = "\n".join(str(c[0][0]) if c[0] else "" for c in p.call_args_list)
+        self.assertIn("\x1b[0m 2\n", aus)  # zwei Eingaben
+        self.assertIn("Alter Router-Teil", aus)
+
+    def test_ohne_endantwort_gilt_letzte_zwischenmeldung(self):
+        z = self.m.zusammenfassen([("user", "F", None), ("zwischen", "Z1", None), ("zwischen", "Z2", None)])
+        self.assertEqual(z["antwort"], "Z2")
+        z = self.m.zusammenfassen([("assistant", "A", None), ("zwischen", "Z", None)])
+        self.assertEqual(z["antwort"], "A")
+
+    def test_inhaltssuche_umlaut_gross_klein_in_maskierter_datei(self):
+        sitzung(self.home, ID_E, self.arbeit, [user("Über den Drucker", self.arbeit)])  # als \u00dc
+        for q in ("über", "ÜBER", "Über"):
+            with self.subTest(q=q):
+                _, t = self.m.inhaltssuche(q, "claude")
+                self.assertEqual(t, {ID_E: 1})
+
+    def test_inhaltssuche_im_gewaehlten_agenten(self):
+        with mock.patch.dict(os.environ, {"FZF_BORDER_LABEL": self.m.rahmen("codex")}), \
+                mock.patch("builtins.print") as p:
+            self.m.main(["--liste", "--inhalt", "router"])
+        aus = p.call_args[0][0]
+        self.assertTrue(aus.startswith(f"codex:{ID_X}\t"))
+        self.assertIn("[3×]", aus)
+        self.assertNotIn("agy:", aus)
 
     def test_wechsel_springt_reihum_und_setzt_rahmen(self):
         with mock.patch.dict(os.environ, {"FZF_BORDER_LABEL": self.m.rahmen("agy")}), \
@@ -194,7 +294,7 @@ class ClaudeSitzungenTest(unittest.TestCase):
     def test_titel_mit_tab_und_zeilenumbruch_bleibt_eine_spalte(self):
         sitzung(self.home, ID_E, self.arbeit, [user("Frage", self.arbeit),
                                               zeile(type="ai-title", aiTitle="A\tB\nC")])
-        z = [x for x in self.m.zeilen(self.m.index()) if x.startswith(ID_E)][0]
+        z = [x for x in self.m.liste("claude") if x.startswith(ID_E)][0]
         self.assertEqual(z.count("\t"), 1)
         self.assertNotIn("\n", z)
 
@@ -205,7 +305,7 @@ class ClaudeSitzungenTest(unittest.TestCase):
             user("Echte Frage", self.arbeit)])
         ids = {e["id"] for e in self.m.index()}
         self.assertEqual(ids, {ID_A, ID_E})
-        self.assertTrue(self.m.zeilen(self.m.index()))
+        self.assertTrue(self.m.liste("claude"))
 
     def test_sprache_einstellung_vor_system_englisch_als_rueckfall(self):
         for env, erwartet in (({"AGENT_LAUNCHERS_LANG": "de", "LANG": "en_US.UTF-8"}, "de"),

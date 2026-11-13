@@ -7,20 +7,23 @@ Agenten-Starters (Menue bleibt schlank, volle Funktion im eigenen Fenster).
 
 Zeigt alle lokalen Sitzungen von Claude Code, Codex und Agy wie die
 Seitenleiste von Claude Chat: neueste oben, Agentenwahl oben im Rahmen
-(Tab/Shift+Tab). Fuer Claude zusaetzlich Vorschau, Inhaltssuche und Abzweig
-(claude --resume --fork-session). Enter setzt eine Sitzung in einem neuen
-Terminalfenster fort. Terminal-Oberflaeche mit fzf.
+(Tab/Shift+Tab), Vorschau und Inhaltssuche fuer alle drei, fuer Claude
+zusaetzlich Abzweig (claude --resume --fork-session). Enter setzt eine
+Sitzung in einem neuen Terminalfenster fort. Terminal-Oberflaeche mit fzf.
 
 Aufruf:
   agent-sessions                             Uebersicht
   agent-sessions --liste [--agent A]         Zeilen fuer fzf (SCHLUESSEL<TAB>Anzeige)
-  agent-sessions --liste --inhalt TEXT       Claude-Inhaltssuche
+  agent-sessions --liste --inhalt TEXT       Inhaltssuche (Agent aus FZF_BORDER_LABEL)
   agent-sessions --wechsel 1|-1|0            fzf-transform: Agentenwahl
   agent-sessions --vorschau ID               Vorschau einer Sitzung
   agent-sessions --oeffnen ID [--abzweig]    Sitzung in neuem Fenster oeffnen
 
 Liest nur: $CLAUDE_CONFIG_DIR (Standard ~/.claude) projects/*/*.jsonl und
-sessions/*.json; Codex/Agy ueber bin/agent-launcher-status. Zwischenspeicher
+sessions/*.json; Codex/Agy-Liste ueber bin/agent-launcher-status, fuer
+Vorschau und Suche die Codex-Rollouts (~/.codex/sessions) und die
+Agy-Verlaeufe (~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/
+transcript_full.jsonl bzw. transcript.jsonl). Zwischenspeicher
 $XDG_CACHE_HOME/agent-sessions/index.json (wegwerfbar, nur fuer den Nutzer
 lesbar: enthaelt Gespraechsauszuege). Kein Hintergrunddienst, kein Timer, kein Netz.
 Abhaengigkeiten: python3, fzf; optional rg (schnellere Inhaltssuche),
@@ -43,6 +46,8 @@ REG = os.path.join(BASIS, "sessions")
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"),
                      "agent-sessions", "index.json")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+CODEX = os.path.join(HOME, ".codex", "sessions")
+AGY_BRAIN = os.path.join(HOME, ".gemini", "antigravity-cli", "brain")
 SELF = os.path.abspath(__file__)
 VERSION = 2
 WOCHENTAG = {"de": ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"],
@@ -80,6 +85,13 @@ CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u2060\uf
 REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 TYPEN = ('"type":"user"', '"type":"assistant"', '"type":"ai-title"',
          '"type":"custom-title"', '"type":"last-prompt"')
+# Codex: neue Rollouts (item_completed) und aeltere (event_msg). Agy: Eingabe
+# steht in <USER_REQUEST>, daneben Metadaten und Einstellungen.
+TEILE_CLAUDE = ('"type":"user"', '"type":"assistant"')
+TEILE_CODEX = ('"UserMessage"', '"AgentMessage"', '"user_message"', '"agent_message"')
+TEILE_AGY = ('"USER_INPUT"', '"PLANNER_RESPONSE"')
+CODEX_INTERN = ("<environment_context", "<user_instructions", "# AGENTS.md instructions", "<turn_aborted")
+AGY_FRAGE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
 
 
 AGENTEN = ["alle", "claude", "codex", "agy"]
@@ -194,6 +206,95 @@ def ordner_zulaessig(cwd):
         and ".." not in cwd.split("/") and os.path.isdir(cwd)
 
 
+def _datensaetze(pfad, teile, filt=None):
+    """JSON-Zeilen mit einem der Teile (billiger Vorfilter vor json.loads)."""
+    with open(pfad, encoding="utf-8", errors="replace") as f:
+        for zeile in f:
+            if not any(t in zeile for t in teile) or (filt and not filt(zeile)):
+                continue
+            try:
+                r = json.loads(zeile)
+            except Exception:
+                continue
+            if isinstance(r, dict):
+                yield r
+
+
+def _blocktext(c):
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        # Codex schreibt Eingaben als "text", Antworten als "Text"
+        return "\n".join(_str(b.get("text")) for b in c if isinstance(b, dict)
+                         and _str(b.get("type")).lower() in ("text", "input_text", "output_text"))
+    return ""
+
+
+def nachrichten_claude(pfad, filt=None):
+    for r in _datensaetze(pfad, TEILE_CLAUDE, filt):
+        if r.get("type") in ("user", "assistant"):
+            yield r["type"], text_aus(r.get("message")), zeitstempel(_str(r.get("timestamp")))
+
+
+def nachrichten_codex(pfad, filt=None):
+    """(rolle, text, zeit) aus einem Codex-Rollout. Neue Rollouts haben
+    item_completed (UserMessage/AgentMessage), aeltere nur event_msg.
+    Zwischenmeldungen (phase "commentary") zaehlen fuer die Suche, als
+    letzte Antwort gilt die Endantwort (Rolle "assistant"), ohne sie die
+    letzte Zwischenmeldung (Rolle "zwischen")."""
+    aus, neu_texte = [], set()
+    for r in _datensaetze(pfad, TEILE_CODEX, filt):
+        p = r.get("payload")
+        if not isinstance(p, dict):
+            continue
+        ts = zeitstempel(_str(r.get("timestamp")))
+        it = p.get("item")
+        if p.get("type") == "item_completed" and isinstance(it, dict):
+            rolle = {"UserMessage": "user", "AgentMessage": "assistant"}.get(_str(it.get("type")))
+            if rolle == "assistant" and it.get("phase") == "commentary":
+                rolle = "zwischen"
+            if rolle:
+                t = _blocktext(it.get("content")).strip()
+                neu_texte.add(t)
+                aus.append((rolle, t, ts, True))
+        elif r.get("type") == "event_msg" and p.get("type") in ("user_message", "agent_message"):
+            rolle = "user" if p["type"] == "user_message" else \
+                "zwischen" if p.get("phase") == "commentary" else "assistant"
+            aus.append((rolle, _str(p.get("message")).strip(), ts, False))
+    # Fortgesetzte alte Sitzungen enthalten beide Formen: alte Datensaetze
+    # nur auslassen, wenn dieselbe Nachricht auch in neuer Form vorliegt.
+    return [(r, t, z) for r, t, z, neu in aus if t and (neu or t not in neu_texte)
+            and not (r == "user" and t.startswith(CODEX_INTERN))]
+
+
+def nachrichten_agy(pfad, filt=None):
+    aus = []
+    for r in _datensaetze(pfad, TEILE_AGY, filt):
+        ts = zeitstempel(_str(r.get("created_at")))
+        if r.get("type") == "USER_INPUT":
+            m = AGY_FRAGE.search(_str(r.get("content")))
+            if m and m.group(1):
+                aus.append(("user", m.group(1), ts))
+        elif r.get("type") == "PLANNER_RESPONSE":
+            t = _str(r.get("content")).strip()
+            if t:
+                aus.append(("assistant", t, ts))
+    return aus
+
+
+NACHRICHTEN = {"claude": nachrichten_claude, "codex": nachrichten_codex, "agy": nachrichten_agy}
+
+
+def zusammenfassen(nachr):
+    """Vorschau-Angaben aus (rolle, text, zeit), wie auswerten() fuer Claude."""
+    fragen = [t for r, t, _ in nachr if r == "user"]
+    antworten = [t for r, t, _ in nachr if r == "assistant"] or [t for r, t, _ in nachr if r == "zwischen"]
+    zeiten = [z for _, _, z in nachr if z]
+    return {"fragen": len(fragen), "erste": fragen[0][:2000] if fragen else "",
+            "letzte": fragen[-1][:2000] if fragen else "", "antwort": antworten[-1][:6000] if antworten else "",
+            "beginn": min(zeiten) if zeiten else None, "ende": max(zeiten) if zeiten else None}
+
+
 def index():
     try:
         with open(CACHE) as f:
@@ -219,6 +320,7 @@ def index():
                 continue  # eine kaputte Datei soll die Liste nicht leeren
             e["k"] = schluessel
         e["id"] = sid
+        e["pfad"] = pfad
         neu[pfad] = e
     try:
         # Nur fuer den Nutzer lesbar: der Index enthaelt Gespraechsauszuege
@@ -328,12 +430,6 @@ def _formatieren(zeilen_, treffer=None, mit_agent=False):
     return aus
 
 
-def zeilen(eintraege, treffer=None):
-    """Zeilen fuer Claude-Sitzungen (ID<TAB>Anzeige)."""
-    auf = offene()
-    return _formatieren([_claude_zeile(e, auf) for e in eintraege], treffer)
-
-
 def liste(agent="alle"):
     """Zeilen fuer die gewaehlte Agenten-Ansicht, neueste oben."""
     r = []
@@ -364,49 +460,74 @@ def wechsel(schritt):
           f"+change-border-label:{rahmen(a)}")
 
 
-def inhaltssuche(q):
-    """Sucht im eigentlichen Gespraechstext (ohne system-reminder), nicht im Rohformat."""
+def datei_andere(i):
+    """Verlaufsdatei einer Codex-/Agy-Sitzung oder None (Agy: nicht jede hat eine)."""
+    if i.get("agent") == "codex":
+        f = str(i.get("file") or "")
+        return f if f.startswith(CODEX + "/") and f.endswith(".jsonl") and os.path.isfile(f) else None
+    d = os.path.join(AGY_BRAIN, i["id"], ".system_generated", "logs")  # id ist per SAFE_ID geprueft
+    for n in ("transcript_full.jsonl", "transcript.jsonl"):  # _full ist nicht gekuerzt
+        if os.path.isfile(os.path.join(d, n)):
+            return os.path.join(d, n)
+    return None
+
+
+def _kandidaten(muster, dateien):
+    """Dateien, die eines der Muster enthalten (rg); ohne rg alle."""
+    if shutil.which("rg") and dateien:
+        befehl = ["rg", "-l", "-i", "-F", "--no-ignore", "--hidden", "--no-messages"]
+        for m in muster:
+            befehl += ["-e", m]
+        try:
+            r = subprocess.run(befehl + ["--"] + dateien, capture_output=True, text=True, timeout=60)
+            if r.returncode in (0, 1):
+                return set(r.stdout.splitlines())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return set(dateien)
+
+
+def inhaltssuche(q, agent="alle"):
+    """Sucht im eigentlichen Gespraechstext (Eingaben und Antworten, ohne
+    system-reminder bzw. Agy-Metadaten), nicht im Rohformat."""
     q = sauber(q)
     if not q:
         return [], {}
-    alle = {e["id"]: e for e in index()}
-    # Die Verlaufsdateien sind JSON: " und \ stehen dort maskiert. Vorfilter
-    # daher mit der maskierten Form, gezaehlt wird im entpackten Text.
-    roh = json.dumps(q, ensure_ascii=False)[1:-1]
-    kandidaten = None
-    if shutil.which("rg"):
-        try:
-            kandidaten = subprocess.run(
-                ["rg", "-l", "-i", "-F", "--no-ignore", "--hidden", "--glob", "*.jsonl", "--max-depth", "2", "--", roh, PROJ],
-                capture_output=True, text=True, timeout=60).stdout.splitlines()
-        except Exception:
-            kandidaten = None
-    if kandidaten is None:
-        kandidaten = glob.glob(os.path.join(PROJ, "*", "*.jsonl"))
-    ql, rl = q.lower(), roh.lower()
-    treffer = {}
-    for pfad in kandidaten:
-        sid = os.path.basename(pfad)[:-6]
-        if sid not in alle:
+    quellen = []  # (Zeile, Agent, Datei)
+    if agent in ("alle", "claude"):
+        auf = offene()
+        quellen += [(_claude_zeile(e, auf), "claude", e["pfad"]) for e in index() if e.get("pfad")]
+    for a in ("codex", "agy"):
+        if agent in ("alle", a):
+            for i in andere(a):
+                d = datei_andere(i)
+                if d:
+                    quellen.append((_andere_zeile(i), a, d))
+    # Die Verlaufsdateien sind JSON: " und \ stehen dort maskiert, Umlaute
+    # mal im Klartext, mal als \uXXXX. Vorfilter daher mit beiden maskierten
+    # Formen, gezaehlt wird im entpackten Text.
+    # rg -i und lower() greifen nicht in \uXXXX: Ü steht dort als \u00dc,
+    # ü als \u00fc. Daher auch die maskierten Formen in Klein- und Grossschrift.
+    muster = {json.dumps(q, ensure_ascii=False)[1:-1]} | {json.dumps(v)[1:-1] for v in (q, q.lower(), q.upper())}
+    ml, ql = [m.lower() for m in muster], q.lower()
+
+    def filt(zeile):
+        z = zeile.lower()
+        return any(m in z for m in ml)
+
+    kandidaten = _kandidaten(sorted(muster), [d for _, _, d in quellen])
+    treffer, gefunden = {}, []
+    for z, a, d in quellen:
+        if d not in kandidaten:
             continue
-        n = 0
         try:
-            f = open(pfad, encoding="utf-8", errors="replace")
-        except OSError:
+            n = sum(t.lower().count(ql) for _, t, _ in NACHRICHTEN[a](d, filt))
+        except Exception:  # eine kaputte Datei soll die Trefferliste nicht leeren
             continue
-        with f:
-            for zeile in f:
-                if ('"type":"user"' not in zeile and '"type":"assistant"' not in zeile) or rl not in zeile.lower():
-                    continue
-                try:
-                    r = json.loads(zeile)
-                except Exception:
-                    continue
-                if isinstance(r, dict):
-                    n += text_aus(r.get("message")).lower().count(ql)
         if n:
-            treffer[sid] = n
-    return [alle[s] for s in treffer], treffer
+            treffer[z["key"]] = n
+            gefunden.append(z)
+    return gefunden, treffer
 
 
 def finde(sid):
@@ -444,25 +565,59 @@ def _andere_finden(schluessel):
     return next((i for i in andere(agent) if i["id"] == sid), None)
 
 
+def ZEITFORMAT():
+    return tr("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M")
+
+
+def _vorschau_drucken(titel_, agent, cwd, e, offen):
+    B, D, N = "\x1b[1m", "\x1b[2m", "\x1b[0m"
+
+    def absatz(s, n):
+        z = [x[:2000] for x in sauber(s, einzeilig=False).splitlines()]  # Umbruch macht fzf (wrap-word)
+        return "\n".join(z[:n] + ([D + "…" + N] if len(z) > n else []))
+
+    print(B + sauber(titel_) + N)
+    wer = "" if agent == "claude" else f"{D}Agent:{N} {name(agent)}   "
+    print(f"{wer}{D}{tr('Ordner', 'Folder')}:{N} {sauber(ordner_kurz(cwd))}   "
+          f"{D}{tr('Eingaben', 'Prompts')}:{N} {e['fragen']}")
+    von = datetime.fromtimestamp(e["beginn"]).strftime(ZEITFORMAT()) if e["beginn"] else "?"
+    bis = datetime.fromtimestamp(e["ende"]).strftime(ZEITFORMAT()) if e["ende"] else "?"
+    print(f"{D}{tr('Zeitraum', 'Period')}:{N} {von} - {bis}")
+    if offen:
+        print("\x1b[33m● " + tr("gerade in einem Fenster offen", "open in a window right now") + "\x1b[0m")
+    if e["erste"]:
+        print()
+        print(B + tr("Erste Eingabe", "First prompt") + N)
+        print(absatz(e["erste"], 8))
+    if e["letzte"] and e["letzte"] != e["erste"]:
+        print()
+        print(B + tr("Letzte Eingabe", "Last prompt") + N)
+        print(absatz(e["letzte"], 6))
+    if e.get("antwort"):
+        print()
+        print(B + tr("Letzte Antwort", "Last answer") + N)
+        print(absatz(e["antwort"], 14))
+
+
 def vorschau_andere(schluessel):
     i = _andere_finden(schluessel)
     if not i:
         print(tr("Sitzung nicht gefunden.", "Session not found."))
         return
-    B, D, N = "\x1b[1m", "\x1b[2m", "\x1b[0m"
-    print(B + sauber(str(i.get("title") or tr("(ohne Titel)", "(untitled)"))) + N)
-    print(f"{D}Agent:{N} {name(i['agent'])}   {D}{tr('Ordner', 'Folder')}:{N} {sauber(ordner_kurz(str(i['path'])))}")
-    zuletzt = datetime.fromtimestamp(float(i.get('updated') or 0)).strftime(ZEITFORMAT())
-    print(f"{D}{tr('Zuletzt', 'Last used')}:{N} {zuletzt}")
-    if i.get("active"):
-        print("\x1b[33m● " + tr("gerade in einem Fenster offen", "open in a window right now") + "\x1b[0m")
-    print()
-    print(D + tr("Vorschau, Inhaltssuche und Abzweig gibt es bisher nur für Claude.",
-                 "Preview, content search and fork are Claude-only so far.") + N)
-
-
-def ZEITFORMAT():
-    return tr("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M")
+    e = {"fragen": 0, "erste": "", "letzte": "", "antwort": "", "beginn": None, "ende": None}
+    d = datei_andere(i)
+    if d:
+        try:
+            e = zusammenfassen(NACHRICHTEN[i["agent"]](d))
+        except Exception:
+            d = None
+    if not e["ende"]:
+        e["ende"] = float(i.get("updated") or 0) or None
+    _vorschau_drucken(str(i.get("title") or tr("(ohne Titel)", "(untitled)")), i["agent"],
+                      str(i["path"]), e, bool(i.get("active")))
+    if not d or not e["fragen"]:
+        print()
+        print("\x1b[2m" + tr("Kein lesbarer Verlauf gefunden.", "No readable transcript found.") + "\x1b[0m")
 
 
 def vorschau(sid):
@@ -473,32 +628,8 @@ def vorschau(sid):
         print(tr("Sitzung nicht gefunden.", "Session not found."))
         return
     e = auswerten(pfad)
-    B, D, N = "\x1b[1m", "\x1b[2m", "\x1b[0m"
-
-    def absatz(s, n):
-        z = [x[:2000] for x in sauber(s, einzeilig=False).splitlines()]  # Umbruch macht fzf (wrap-word)
-        return "\n".join(z[:n] + ([D + "…" + N] if len(z) > n else []))
-
-    print(B + titel(e) + N)
-    von = datetime.fromtimestamp(e["beginn"]).strftime(ZEITFORMAT()) if e["beginn"] else "?"
-    bis = datetime.fromtimestamp(e["ende"]).strftime(ZEITFORMAT()) if e["ende"] else "?"
-    print(f"{D}{tr('Ordner', 'Folder')}:{N} {sauber(ordner_kurz(e['cwd']))}   "
-          f"{D}{tr('Eingaben', 'Prompts')}:{N} {e['fragen']}")
-    print(f"{D}{tr('Zeitraum', 'Period')}:{N} {von} - {bis}")
-    if sid in offene():
-        print("\x1b[33m● " + tr("gerade in einem Fenster offen", "open in a window right now") + "\x1b[0m")
-    print()
-    print(B + tr("Erste Eingabe", "First prompt") + N)
-    print(absatz(e["erste"], 8))
-    if e["letzte"] and e["letzte"] != e["erste"]:
-        print()
-        print(B + tr("Letzte Eingabe", "Last prompt") + N)
-        print(absatz(e["letzte"], 6))
-    a = letzte_antwort(pfad)
-    if a:
-        print()
-        print(B + tr("Letzte Antwort", "Last answer") + N)
-        print(absatz(a, 14))
+    e["antwort"] = letzte_antwort(pfad)
+    _vorschau_drucken(titel(e), "claude", e["cwd"], e, sid in offene())
 
 
 def melden(text, kritisch=False):
@@ -615,10 +746,10 @@ def oberflaeche():
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         pass
     me = SELF
-    kopf = tr("Tab/Shift+Tab Agent · Enter fortsetzen · Strg+F Abzweig · Esc schließen\n"
-              "Strg+S im Gesprächsinhalt suchen (Claude) · Strg+R neu laden · ● = gerade offen",
-              "Tab/Shift+Tab agent · Enter resume · Ctrl+F fork · Esc close\n"
-              "Ctrl+S search conversation content (Claude) · Ctrl+R reload · ● = open now")
+    kopf = tr("Tab/Shift+Tab Agent · Enter fortsetzen · Strg+F Abzweig (Claude) · Esc schließen\n"
+              "Strg+S im Gesprächsinhalt suchen · Strg+R neu laden · ● = gerade offen",
+              "Tab/Shift+Tab agent · Enter resume · Ctrl+F fork (Claude) · Esc close\n"
+              "Ctrl+S search conversation content · Ctrl+R reload · ● = open now")
     args = [
         "fzf", "--ansi", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--tiebreak=index",
         "--layout=reverse", "--info=inline-right", "--header", kopf, "--header-first",
@@ -627,8 +758,7 @@ def oberflaeche():
         "--bind", f"enter:execute-silent('{me}' --oeffnen {{1}})+abort",
         "--bind", f"ctrl-f:execute-silent('{me}' --oeffnen {{1}} --abzweig)+abort",
         "--bind", f"ctrl-s:reload('{me}' --liste --inhalt {{q}})"
-                  f"+transform-prompt(printf '{tr('Im Inhalt', 'In content')}: %s › ' {{q}})+clear-query"
-                  f"+change-border-label:{rahmen('claude')}",
+                  f"+transform-prompt(printf '{tr('Im Inhalt', 'In content')}: %s › ' {{q}})+clear-query",
         "--bind", f"tab:transform('{me}' --wechsel 1)",
         "--bind", f"shift-tab:transform('{me}' --wechsel -1)",
         "--bind", f"ctrl-r:transform('{me}' --wechsel 0)",
@@ -645,8 +775,9 @@ def main(a):
         oberflaeche()
     elif a[0] == "--liste":
         if len(a) >= 3 and a[1] == "--inhalt":
-            e, t = inhaltssuche(" ".join(a[2:]))
-            z = zeilen(e, t)
+            agent = aktueller_agent()  # fzf gibt FZF_BORDER_LABEL an reload weiter
+            e, t = inhaltssuche(" ".join(a[2:]), agent)
+            z = _formatieren(e, t, mit_agent=(agent == "alle"))
         elif len(a) == 3 and a[1] == "--agent" and a[2] in AGENTEN:
             z = liste(a[2])
         else:
