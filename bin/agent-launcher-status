@@ -23,11 +23,28 @@ HOME = pathlib.Path.home()
 WORK = (HOME / "Work").resolve()
 
 
+def lang() -> str:
+    """de oder en: Einstellung `language` des Widgets (als --lang bzw.
+    AGENT_LAUNCHERS_LANG), sonst die Systemsprache; Englisch als Rueckfall."""
+    v = os.environ.get("AGENT_LAUNCHERS_LANG", "")
+    if v in ("de", "en"):
+        return v
+    for k in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        x = os.environ.get(k)
+        if x:
+            return "de" if x.lower().startswith("de") else "en"
+    return "en"
+
+
+def tr(de: str, en: str) -> str:
+    return de if lang() == "de" else en
+
+
 def read_json(path: pathlib.Path) -> Any | None:
     try:
         with path.open("r", encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
 
 
@@ -46,7 +63,7 @@ def fmt_reset(value: Any) -> str:
         now = datetime.now().astimezone()
         if dt.date() == now.date():
             return dt.strftime("%H:%M")
-        return dt.strftime("%d.%m. %H:%M")
+        return dt.strftime(tr("%d.%m. %H:%M", "%b %d %H:%M"))
     except Exception:
         return str(value)
 
@@ -86,7 +103,7 @@ def codex_resumable() -> bool:
                     if cwd and str(pathlib.Path(cwd).expanduser().resolve()) == target:
                         return True
                     break
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, AttributeError):
             continue
     return False
 
@@ -129,7 +146,7 @@ def claude_resumable() -> bool:
                     obj = json.loads(line)
                     if obj.get("cwd") == target:
                         return True
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, AttributeError):
             continue
     return False
 
@@ -159,7 +176,7 @@ def parse_omarchy_limits(data: Any) -> tuple[str, list[str]] | None:
             continue
         remaining = round((1.0 - used) * 100)
         reset = fmt_reset(limit.get("resetsAt") or limit.get("resetTime") or limit.get("reset_time"))
-        line = f"{label}: {remaining}% frei"
+        line = tr(f"{label}: {remaining}% frei", f"{label}: {remaining}% left")
         if reset:
             line += f" · Reset {reset}"
         lines.append(line)
@@ -177,7 +194,7 @@ def codex_quota() -> list[str]:
                 out.append(f"Plan: {tier}")
             out.extend(lines)
             return out
-    return ["Quota: noch kein lokaler Omarchy-Usage-Stand gefunden"]
+    return [tr("Quota: noch kein lokaler Omarchy-Usage-Stand gefunden", "Quota: no local Omarchy usage record yet")]
 
 
 def claude_quota() -> list[str]:
@@ -201,7 +218,7 @@ def claude_quota() -> list[str]:
                 out.append(help_text)
             if out:
                 return out
-    return ["Quota: noch kein lokaler Claude-Usage-Stand gefunden"]
+    return [tr("Quota: noch kein lokaler Claude-Usage-Stand gefunden", "Quota: no local Claude usage record yet")]
 
 
 def walk_dicts(obj: Any):
@@ -250,7 +267,9 @@ def candidate_agy_cache_files() -> list[pathlib.Path]:
     paths.append(HOME / ".gemini" / "antigravity-cli" / "usage-limits.json")
 
     # Best-effort discovery for third-party Omarchy quota widgets. Only inspect
-    # small JSON files whose names look relevant; never inspect token/auth files.
+    # small JSON files whose *file name* names Agy; never inspect token/auth
+    # files. (Matching "usage"/"quota" in the path also picked up Omarchy's
+    # claude.json/codex.json and showed their quota as Agy's.)
     for root in [HOME / ".local" / "state" / "omarchy", HOME / ".cache" / "omarchy"]:
         if not root.is_dir():
             continue
@@ -258,7 +277,7 @@ def candidate_agy_cache_files() -> list[pathlib.Path]:
             for p in root.rglob("*.json"):
                 name = p.name.lower()
                 full = str(p).lower()
-                if not any(word in name or word in full for word in ("gemini", "antigravity", "agy", "quota", "usage")):
+                if not any(word in name for word in ("gemini", "antigravity", "agy")):
                     continue
                 if any(secret in name or secret in full for secret in ("oauth", "token", "credential", "auth")):
                     continue
@@ -305,14 +324,15 @@ def agy_quota() -> list[str]:
                 best = candidate
     if best:
         label, remaining, reset = best
-        line = f"Quota: {round(remaining * 100)}% frei"
+        line = tr(f"Quota: {round(remaining * 100)}% frei", f"Quota: {round(remaining * 100)}% left")
         if label and label.lower() not in ("quota", "limit"):
             line += f" · {label}"
         if reset:
             line += f" · Reset {reset}"
         return [line]
 
-    return ["Quota: kein kompatibler lokaler Agy-Usage-Cache gefunden", "In Agy: /usage"]
+    return [tr("Quota: kein kompatibler lokaler Agy-Usage-Cache gefunden", "Quota: no compatible local Agy usage cache found"),
+            "In Agy: /usage"]
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +342,9 @@ SESSION_DAYS = 14
 SESSION_LIMIT = 6
 # Automatische Claude-Titel ohne Aussage (Sitzung begann mit einem Bild o. Ae.)
 GENERIC_TITLES = {"image attachment", "image", "screenshot", "untitled", "new session"}
+# Titel sind Modellausgaben: Steuer-, C1-, Bidi- und Null-Breite-Zeichen
+# entfernen (wie bin/agent-sessions), bevor das Menue sie anzeigt.
+CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u2060\ufeff\u202a-\u202e\u2066-\u2069]")
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{7,79}")  # nur mit fullmatch: kein fuehrendes "-", kein "\n"
 
 
@@ -368,9 +391,11 @@ def tail_title(path: pathlib.Path, keys: tuple[str, ...]) -> str:
                     obj = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(obj, dict):
+                    continue  # Format undokumentiert: Unerwartetes ueberspringen
                 for k in keys:
-                    if obj.get(k):
-                        title = str(obj[k])
+                    if isinstance(obj.get(k), str) and obj[k]:
+                        title = obj[k]
     except OSError:
         pass
     return title
@@ -386,14 +411,15 @@ def first_user_text(path: pathlib.Path, limit: int = 60) -> str:
                 if '"type":"user"' not in line:
                     continue
                 obj = json.loads(line)
-                content = (obj.get("message") or {}).get("content")
+                msg = obj.get("message") if isinstance(obj, dict) else None
+                content = msg.get("content") if isinstance(msg, dict) else None
                 if isinstance(content, list):
                     content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
                 text = re.sub(r"\[(Image|Pasted text)[ :#][^\]]*\]", " ", str(content or ""))
                 text = re.sub(r"\s+", " ", text).strip()
                 if len(text) >= 8 and not text.startswith("<"):  # "ok", "1", "ja" sagen nichts
                     return text[:limit]
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError, AttributeError):
         pass
     return ""
 
@@ -432,10 +458,11 @@ def claude_sessions(windows: set[int], since: float) -> list[dict]:
                         line = fh.readline()
                         if not line:
                             break
-                        cwd = str(json.loads(line).get("cwd") or "")
+                        obj = json.loads(line)
+                        cwd = str(obj.get("cwd") or "") if isinstance(obj, dict) else ""
                         if cwd:
                             break
-            except (OSError, ValueError):
+            except (OSError, ValueError, TypeError, AttributeError):
                 pass
         if not cwd or cwd.startswith("/tmp/") or not pathlib.Path(cwd).is_dir():
             continue
@@ -491,7 +518,7 @@ def codex_sessions(windows: set[int], since: float, limit: int | None = 40) -> l
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
                 meta = (json.loads(fh.readline()) or {}).get("payload") or {}
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError, AttributeError):
             continue
         sid, cwd = str(meta.get("id") or ""), str(meta.get("cwd") or "")
         if not SAFE_ID.fullmatch(sid) or meta.get("thread_source", "user") != "user":
@@ -531,12 +558,12 @@ def agy_sessions(since: float) -> list[dict]:
 def fmt_age(ts: float) -> str:
     mins = int((time.time() - ts) / 60)
     if mins < 1:
-        return "gerade eben"
+        return tr("gerade eben", "just now")
     if mins < 60:
-        return f"vor {mins} min"
+        return tr(f"vor {mins} min", f"{mins} min ago")
     if mins < 24 * 60:
-        return f"vor {mins // 60} h"
-    return f"vor {mins // 1440} T"
+        return tr(f"vor {mins // 60} h", f"{mins // 60} h ago")
+    return tr(f"vor {mins // 1440} T", f"{mins // 1440} d ago")
 
 
 def sessions() -> list[dict]:
@@ -557,7 +584,8 @@ def sessions() -> list[dict]:
             kept.append(i)
     items = kept
     for i in items:
-        i["title"] = re.sub(r"\s+", " ", i["title"]).strip()[:48]
+        i["title"] = re.sub(r"\s+", " ", CTRL.sub("", str(i["title"]))).strip()[:48]
+        i["cwd"] = CTRL.sub("", str(i["cwd"]))
     # Gleich lautende Titel desselben Agenten unterscheidbar machen
     counts: dict[tuple[str, str], int] = {}
     for i in items:
@@ -566,19 +594,26 @@ def sessions() -> list[dict]:
         if counts[(i["agent"], i["title"])] > 1:
             i["title"] = f"{i['title'][:40]} ({i['id'][:6]})"
     for i in items:
-        state = {"busy": "arbeitet", "idle": "wartet"}.get(i["status"], "läuft") if i["active"] else fmt_age(i["updated"])
+        state = ({"busy": tr("arbeitet", "working"), "idle": tr("wartet", "waiting")}.get(i["status"], tr("läuft", "running"))
+                 if i["active"] else fmt_age(i["updated"]))
         i["detail"] = f"{state} · {i['cwd']}"
     return items
 
 
 def tooltip(name: str, resumable: bool, quota_lines: list[str]) -> str:
-    lines = [name, f"Session in ~/Work: {'resume verfügbar' if resumable else 'keine gespeicherte Session erkannt'}"]
+    lines = [name, tr(f"Sitzung in ~/Work: {'fortsetzbar' if resumable else 'keine gespeicherte Sitzung erkannt'}",
+                      f"Session in ~/Work: {'resumable' if resumable else 'no saved session found'}")]
     lines.extend(quota_lines)
     return "\n".join(lines)
 
 
 def main() -> int:
-    if "--sessions" in sys.argv[1:]:
+    args = sys.argv[1:]
+    if "--lang" in args:  # vom Widget: Einstellung language (de/en/auto)
+        i = args.index("--lang")
+        if i + 1 < len(args) and args[i + 1] in ("de", "en"):
+            os.environ["AGENT_LAUNCHERS_LANG"] = args[i + 1]
+    if "--sessions" in args:
         print(json.dumps({"sessions": sessions()}, ensure_ascii=False))
         return 0
     c_resume = codex_resumable()

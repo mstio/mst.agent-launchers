@@ -19,12 +19,22 @@ Item {
     // All launchers intentionally use ~/Work as their workspace.
     readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/mst.agent-launchers"
 
+    // Sprache: Einstellung "language" (de/en/auto) im Widget-Eintrag von
+    // ~/.config/omarchy/shell.json, sonst Systemsprache; Englisch als Rueckfall.
+    readonly property string lang: {
+        var s = settings ? settings.language : undefined
+        if (s === "de" || s === "en")
+            return s
+        return Qt.locale().name.indexOf("de") === 0 ? "de" : "en"
+    }
+    function t(de, en) { return lang === "de" ? de : en }
+
     property bool codexResumable: false
     property bool agyResumable: false
     property bool claudeResumable: false
-    property string codexTooltip: "Codex\nStatus wird geladen …"
-    property string agyTooltip: "Agy\nStatus wird geladen …"
-    property string claudeTooltip: "Claude\nStatus wird geladen …"
+    property string codexTooltip: "Codex\n" + t("Status wird geladen …", "Loading status …")
+    property string agyTooltip: "Agy\n" + t("Status wird geladen …", "Loading status …")
+    property string claudeTooltip: "Claude\n" + t("Status wird geladen …", "Loading status …")
 
     implicitWidth: button.width
     implicitHeight: button.height
@@ -38,7 +48,7 @@ Item {
 
     readonly property bool anyResumable: codexResumable || agyResumable || claudeResumable
     readonly property string combinedTooltip: claudeTooltip + "\n\n" + codexTooltip + "\n\n" + agyTooltip
-        + "\n\nKlick: Agent-Menü · Mitte: Status neu lesen"
+        + "\n\n" + t("Klick: Agent-Menü · Mitte: Status neu lesen", "Click: agent menu · Middle: refresh status")
     readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
     readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -72,7 +82,8 @@ Item {
 
         // No automatic switching, no default-agent mutation and no
         // --dangerously-skip-permissions. The user chooses the agent explicitly.
-        bar.run("cd \"$HOME/Work\" && omarchy-launch-tui --app-id=org.omarchy.agent " + command)
+        // ~/Work legt Omarchy an; fehlt er, im Home starten statt stumm zu scheitern.
+        bar.run("{ cd \"$HOME/Work\" 2>/dev/null || cd \"$HOME\"; } && omarchy-launch-tui --app-id=org.omarchy.agent " + command)
     }
 
     function openSession(item) {
@@ -86,6 +97,10 @@ Item {
         // "focuswindow pid:N" scheitert dort mit einem Syntaxfehler).
         if (item.active && item.focusPid > 0)
             bar.run("hyprctl dispatch 'hl.dsp.focus({ window = \"pid:" + Math.floor(Number(item.focusPid)) + "\" })'")
+        else if (item.active)
+            // Laeuft, aber kein Fenster gefunden (z. B. tmux): nicht doppelt starten.
+            bar.run("notify-send 'AI Agent Launchers' '" + t("Diese Sitzung ist schon offen, ihr Fenster wurde nicht gefunden.",
+                                                              "This session is already open, but its window was not found.") + "'")
         else if (item.command)
             bar.run(String(item.command))
     }
@@ -97,7 +112,7 @@ Item {
         menuOpen = false
         expandedAgent = ""
         if (bar)
-            bar.run("omarchy-launch-tui --app-id=TUI.float '" + pluginDir + "/bin/agent-sessions'")
+            bar.run("omarchy-launch-tui --app-id=TUI.float '" + pluginDir + "/bin/agent-sessions' --lang " + lang)
     }
 
     function refreshSessions() {
@@ -136,15 +151,16 @@ Item {
                 claudeTooltip = String(data.claude.tooltip || "Claude")
             }
         } catch (e) {
-            codexTooltip = "Codex\nStatus konnte nicht gelesen werden"
-            agyTooltip = "Agy\nStatus konnte nicht gelesen werden"
-            claudeTooltip = "Claude\nStatus konnte nicht gelesen werden"
+            var failed = t("Status konnte nicht gelesen werden", "Could not read status")
+            codexTooltip = "Codex\n" + failed
+            agyTooltip = "Agy\n" + failed
+            claudeTooltip = "Claude\n" + failed
         }
     }
 
     Process {
         id: statusProcess
-        command: [root.pluginDir + "/bin/agent-launcher-status"]
+        command: [root.pluginDir + "/bin/agent-launcher-status", "--lang", root.lang]
         stdout: StdioCollector {
             id: statusStdout
             waitForEnd: true
@@ -157,7 +173,7 @@ Item {
 
     Process {
         id: sessionsProcess
-        command: [root.pluginDir + "/bin/agent-launcher-status", "--sessions"]
+        command: [root.pluginDir + "/bin/agent-launcher-status", "--sessions", "--lang", root.lang]
         stdout: StdioCollector {
             id: sessionsStdout
             waitForEnd: true
@@ -283,15 +299,15 @@ Item {
             Repeater {
                 model: [
                     { "label": "Claude", "agent": "claude", "resume": false },
-                    { "label": "Claude fortsetzen", "agent": "claude", "resume": true },
+                    { "label": root.t("Claude fortsetzen", "Resume Claude"), "agent": "claude", "resume": true },
                     { "separator": true },
                     { "label": "Codex", "agent": "codex", "resume": false },
-                    { "label": "Codex fortsetzen", "agent": "codex", "resume": true },
+                    { "label": root.t("Codex fortsetzen", "Resume Codex"), "agent": "codex", "resume": true },
                     { "separator": true },
                     { "label": "Agy", "agent": "agy", "resume": false },
-                    { "label": "Agy fortsetzen", "agent": "agy", "resume": true },
+                    { "label": root.t("Agy fortsetzen", "Resume Agy"), "agent": "agy", "resume": true },
                     { "separator": true },
-                    { "label": "Alle Sitzungen …", "browse": true }
+                    { "label": root.t("Alle Sitzungen …", "All sessions …"), "browse": true }
                 ]
 
                 delegate: Column {
@@ -403,8 +419,8 @@ Item {
                                 anchors.topMargin: subRow.isLast || subRow.isEmpty ? Style.space(6) : Style.space(3)
                                 elide: Text.ElideRight
                                 textFormat: Text.PlainText  // Titel = Modellausgabe, nie als Rich Text deuten
-                                text: subRow.isLast ? "Letzte Sitzung in ~/Work"
-                                    : subRow.isEmpty ? "keine weiteren Sitzungen (14 Tage)"
+                                text: subRow.isLast ? root.t("Letzte Sitzung in ~/Work", "Last session in ~/Work")
+                                    : subRow.isEmpty ? root.t("keine weiteren Sitzungen (14 Tage)", "no other sessions (14 days)")
                                     : (subRow.modelData.active ? "● " : "") + String(subRow.modelData.title || "")
                                 color: root.foreground
                                 opacity: subRow.isEmpty ? 0.5 : 1.0

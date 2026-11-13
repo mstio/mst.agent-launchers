@@ -4,7 +4,8 @@
   "name": "AI Agent Launchers",
   "version": "1.5.0",
   "author": "Matthias Stache",
-  "description": "One icon with a context menu to launch/resume Claude, Codex, and Antigravity, plus a list of running and recent sessions of all three and a window with all sessions of all three (agent choice, search, preview), with session indicators and read-only quota tooltips.",
+  "license": "MIT",
+  "description": "Launch and resume Claude Code, Codex and Agy from one bar icon: running and recent sessions per agent, a window with all sessions (agent choice, search, preview, fork) and read-only quota tooltips. English or German.",
   "kinds": [
     "bar-widget"
   ],

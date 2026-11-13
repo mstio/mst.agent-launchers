@@ -207,6 +207,25 @@ class ClaudeSitzungenTest(unittest.TestCase):
         self.assertEqual(ids, {ID_A, ID_E})
         self.assertTrue(self.m.zeilen(self.m.index()))
 
+    def test_sprache_einstellung_vor_system_englisch_als_rueckfall(self):
+        for env, erwartet in (({"AGENT_LAUNCHERS_LANG": "de", "LANG": "en_US.UTF-8"}, "de"),
+                              ({"AGENT_LAUNCHERS_LANG": "", "LC_ALL": "", "LC_MESSAGES": "", "LANG": "de_DE.UTF-8"}, "de"),
+                              ({"AGENT_LAUNCHERS_LANG": "", "LC_ALL": "", "LC_MESSAGES": "", "LANG": "fr_FR.UTF-8"}, "en"),
+                              ({"AGENT_LAUNCHERS_LANG": "xx", "LC_ALL": "", "LC_MESSAGES": "", "LANG": ""}, "en")):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                self.assertEqual(self.m.sprache(), erwartet)
+                if self.m.STATUS is not None:
+                    self.assertEqual(self.m.STATUS.lang(), erwartet)
+        with mock.patch.dict(os.environ, {"AGENT_LAUNCHERS_LANG": "en"}):
+            self.assertIn("All", self.m.rahmen("alle"))
+        with mock.patch.dict(os.environ, {"AGENT_LAUNCHERS_LANG": "de"}):
+            self.assertIn("Alle", self.m.rahmen("alle"))
+            # Wechsel liest den Rahmen in derselben Sprache zurueck
+            with mock.patch.dict(os.environ, {"FZF_BORDER_LABEL": self.m.rahmen("codex")}), \
+                    mock.patch("builtins.print") as p:
+                self.m.wechsel(1)
+            self.assertIn("--agent agy)", p.call_args[0][0])
+
     def test_offene_sitzung_wird_fokussiert_statt_doppelt_geoeffnet(self):
         with mock.patch.object(self.m.subprocess, "Popen") as popen, \
                 mock.patch.object(self.m, "offene", return_value={ID_A: 4242}), \

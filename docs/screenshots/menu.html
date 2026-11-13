@@ -1,0 +1,53 @@
+<!doctype html>
+<!-- Illustration of the ✦ context menu (English UI, demo sessions).
+     Rendered to menu.png with headless Chrome, see README "Screenshots". -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent launchers menu</title>
+<style>
+  :root { --bg: #1c140b; --fg: #d3cfb2; --dim: rgba(211, 207, 178, .55); --hover: rgba(211, 207, 178, .10);
+          --border: rgba(211, 207, 178, .45); --bar: #150f08; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: #2a2118; font: 13px "JetBrainsMono Nerd Font", "JetBrains Mono", monospace; color: var(--fg); }
+  .stage { width: 400px; padding: 0 16px 16px; }
+  .bar { height: 26px; background: var(--bar); display: flex; justify-content: flex-end; align-items: center;
+         padding-right: 34px; margin: 0 -16px 8px; }
+  .icon { width: 18px; height: 18px; position: relative; }
+  .icon::before { content: "✦"; font-size: 16px; line-height: 18px; }
+  .icon::after { content: ""; position: absolute; right: -2px; top: 0; width: 5px; height: 5px; border-radius: 50%;
+                 background: var(--fg); border: 1px solid var(--bar); }
+  .card { margin-left: auto; width: 300px; background: var(--bg); border: 2px solid var(--border); border-radius: 8px;
+          padding: 6px; box-shadow: 0 6px 24px rgba(0, 0, 0, .45); }
+  .row { height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 4px; }
+  .row.hover { background: var(--hover); }
+  .sep { height: 1px; background: var(--border); opacity: .45; margin: 4px 8px; }
+  .sub { padding: 3px 10px 3px 24px; border-radius: 4px; }
+  .sub .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub .d { font-size: 11px; color: var(--dim); }
+  .sub.hover { background: var(--hover); }
+  .dim { opacity: .5; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="bar"><div class="icon"></div></div>
+  <div class="card">
+    <div class="row">Claude</div>
+    <div class="row hover">Resume Claude <span>• ▾</span></div>
+    <div class="sub"><div class="t">Last session in ~/Work</div></div>
+    <div class="sub hover"><div class="t">Fix flaky login test in CI</div><div class="d">12 min ago · ~/Work/webshop</div></div>
+    <div class="sub"><div class="t">Refactor invoice export to async</div><div class="d">3 h ago · ~/Projects/billing</div></div>
+    <div class="sub"><div class="t">Set up WireGuard on the home server</div><div class="d">1 d ago · ~/Work</div></div>
+    <div class="sep"></div>
+    <div class="row">Codex</div>
+    <div class="row">Resume Codex <span>• ▸</span></div>
+    <div class="sep"></div>
+    <div class="row">Agy</div>
+    <div class="row"><span class="dim">Resume Agy</span> <span>▸</span></div>
+    <div class="sep"></div>
+    <div class="row">All sessions …</div>
+  </div>
+</div>
+</body>
+</html>

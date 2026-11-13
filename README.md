@@ -1,128 +1,133 @@
 # AI Agent Launchers for Omarchy
 
-A compact Omarchy Quattro bar-widget: **one** icon that opens a small context menu for **Claude Code**, **Codex**, and **Agy / Antigravity**.
-The SVG mark is a monochrome mask tinted with the active bar foreground color, so it stays readable across Omarchy themes.
+![All your agent sessions, one click away](preview.png)
 
-## Controls
+One icon in the Omarchy bar for **Claude Code**, **Codex** and **Agy / Antigravity**: start an agent, resume a session, or find *any* earlier session across all folders – like the chat sidebar in Claude, but for your coding agents.
+
+- **Launch and resume** each agent from a small context menu.
+- **Running and recent sessions** per agent, with title, state and folder. A session that is already open gets its window focused instead of a second client on the same transcript.
+- **All sessions …** opens a floating window with all sessions of all three agents (those whose folder still exists in your home): agent choice, filter, preview, search in the conversation content (Claude) and fork for a follow-up question (Claude).
+- **Quota at a glance** in the tooltip, read from local usage records only.
+- English or German, following your system language.
+
+No service, no timer for the session list, no network: everything is read from the agents' own local files when you open the menu or the window.
+
+## Screenshots
+
+| Menu | All sessions |
+|---|---|
+| ![Menu with running and recent Claude sessions](docs/screenshots/menu.png) | ![Window with all sessions and preview](docs/screenshots/window-all.png) |
+
+Search in the conversation content (Ctrl+S):
+
+![Content search](docs/screenshots/window-search.png)
+
+All screenshots show invented demo sessions. The menu is an HTML illustration of the real widget ([`docs/screenshots/menu.html`](docs/screenshots/menu.html)); the windows are real screenshots.
+
+## Install
+
+From the Omarchy plugin marketplace, or:
+
+```bash
+omarchy plugin add https://github.com/mstio/mst.agent-launchers --enable
+```
+
+Update: `omarchy plugin update mst.agent-launchers`. Remove:
+
+```bash
+omarchy plugin disable mst.agent-launchers
+omarchy plugin remove mst.agent-launchers
+```
+
+**Requirements:** Omarchy (Quattro bar), `python3`, `hyprctl` (focus an open session), `notify-send`. For the *All sessions* window also `fzf` ≥ 0.74 (tested with 0.74.5; it uses `transform`, labels and `wrap-word`; an older fzf gets a message). Optional: `rg` for a faster content search. The agents themselves (`claude`, `codex`, `agy`) only need to be installed if you want to use them.
+
+## The menu
 
 | Action | Effect |
 |---|---|
-| Left / right click | toggle the context menu below the icon |
-| Middle click | refresh local status |
+| Left / right click | toggle the menu below the icon |
+| Middle click | refresh the local status |
 | Click outside | close the menu |
 
-Menu rows (all start in `~/Work`):
+| Row | Effect |
+|---|---|
+| Claude / Codex / Agy | start `claude`, `codex`, `agy` in `~/Work` (in your home if `~/Work` does not exist) |
+| Resume … ▸ | expand the sessions of that agent (one agent at a time) |
+| All sessions … | open the window described below |
 
-| Agent | New | Resume |
-|---|---|---|
-| Claude | `claude` | `claude --continue` |
-| Codex | `codex` | `codex resume --last` |
-| Agy | `agy` | `agy -c` |
+Under **Resume … ▸** you get first *Last session in ~/Work* (`claude --continue`, `codex resume --last`, `agy -c`), then the running and recent sessions of that agent: last 14 days, at most 6, running ones first and marked **●**, each with title, state (*working*, *waiting*) or age, and folder.
 
-Clicking **„… fortsetzen ▸“** expands that agent's sessions as sub-items (one agent at a time): first „Letzte Sitzung in ~/Work“ (the previous `--continue` behaviour), then its running and recent sessions (last 14 days, at most 6 per agent, running ones first, marked **●**), each with title, age or state (`arbeitet`/`wartet`) and working directory:
+- Running session (Claude, Codex) → its window is focused, no second client on the same transcript; if its window cannot be found, e.g. inside tmux, you get a notification instead. Agy sessions are not detected as running.
+- Older session → resumed in its own folder: `claude --resume <id>`, `codex resume <id>`, `agy --conversation <id>`.
 
-- running session → its window is focused (`hyprctl dispatch 'hl.dsp.focus({ window = "pid:<terminal>" })'`, Hyprland ≥ 0.56 syntax), no second client on the same transcript
-- older session → resumed in its own directory: `claude --resume <id>`, `codex resume <id>`, `agy --conversation <id>`
+A small **•** on the icon means at least one agent has a resumable session in `~/Work`; resume rows with a detected session carry a **•**, the others are dimmed (still clickable).
 
-Sources (read-only, only when the menu opens, ~0.5 s): `~/.claude/sessions/*.json` (running Claude TUIs) and `~/.claude/projects/*/*.jsonl` (title from `ai-title`/`custom-title`), `~/.codex/session_index.jsonl` plus rollout headers (internal runs such as Guardian review are skipped; running = rollout file held open by a `codex` process), Antigravity `cache/conversation_metadata.json`. Sessions in `/tmp` (e.g. curator runs) are skipped.
+## All sessions
 
-### All sessions (since 1.5.0)
-
-The last menu row **„Alle Sitzungen …“** opens a floating terminal window with *every* local session of Claude Code, Codex and Agy across all folders, like the sidebar in Claude Chat. The menu itself stays small. Idea and original Claude script by bernhard2804 (proposed as `claude-sitzungen` in mstio/polaris-connector#3).
-
-The agent choice sits at the top of the window frame: **Alle · Claude · Codex · Agy**.
+The last menu row opens a floating terminal with all local sessions of all three agents, newest first: every session whose folder still exists below `$HOME` (for Claude: with at least one prompt of your own). The agent choice sits at the top of the window frame: **All · Claude · Codex · Agy**.
 
 | Key | Effect |
 |---|---|
 | Tab / Shift+Tab | next / previous agent |
-| typing | filter titles (fzf) |
-| Enter | resume in a new terminal in the session's folder (`claude --resume`, `codex resume`, `agy --conversation`); if it is already open, focus its window instead |
-| Ctrl+F | Claude: fork for a follow-up question (`--resume --fork-session`), the original transcript stays unchanged |
-| Ctrl+S | Claude: search the typed text in the **conversation content** (hit count per session) |
-| Ctrl+R | reload the current view |
+| typing | filter titles |
+| Enter | resume in a new terminal in the session's folder; if it is already open, focus its window |
+| Ctrl+F | Claude: fork for a follow-up question (`--resume --fork-session`); the original transcript stays unchanged |
+| Ctrl+S | Claude: search the typed text in the conversation content, with hit count per session |
+| Ctrl+R | reload the current agent view (clears the filter and leaves the content search) |
 | Esc | close |
 
-- Preview: for Claude folder, time span, number of prompts, first and last prompt, last answer; for Codex and Agy title, folder and last use (Agy stores its transcripts as binary data). **●** = open right now.
-- Script `bin/agent-sessions`, needs `python3` and `fzf` ≥ 0.74 (tested; uses `transform`, labels and `wrap-word`), optional `rg` for faster content search. Codex and Agy sessions come from `bin/agent-launcher-status` (same rules as the menu, without the 14-day limit). The script can also be run directly or bound to a key, e.g. in `~/.config/hypr/bindings.lua`:
-  `o.bind("SUPER + ALT + H", "Agenten-Sitzungen", "omarchy-launch-tui --app-id=TUI.float ~/.config/omarchy/plugins/mst.agent-launchers/bin/agent-sessions")`
-- The window uses the app id `TUI.float`, which Omarchy already floats and centers (875×600); no window rule needed.
-- Read-only on the agents' own session files; no network, no service, no timer. Lists only sessions whose folder still exists under `$HOME`; opens only a checked session id in such a folder, command as an argument list (no shell). Titles and texts are model output: control, C1, bidi and zero-width characters are stripped before display.
-- Index cache `~/.cache/agent-sessions/index.json` (mode 0600, it contains prompt excerpts), rebuilt per file by mtime and size: first build ~2 s for ~80 Claude sessions, then < 0.1 s.
-- "Open right now" for Claude comes from `~/.claude/sessions/*.json` (process checked via `/proc`, also for npm installs).
-- The transcript formats are undocumented and may change with agent updates; unexpected records are skipped instead of emptying the list.
-- Tests: `python3 -m unittest discover -s tests`.
+- Preview for Claude: folder, period, number of prompts, first and last prompt, last answer. For Codex and Agy: title, folder and last use (Agy stores its transcripts as binary data).
+- The window uses the app id `TUI.float`, which Omarchy already floats and centers; no window rule needed.
+- Own key binding (optional), e.g. in `~/.config/hypr/bindings.lua`:
 
-A small **•** on the icon means at least one agent has a resumable `~/Work` session; in the menu, resume rows with a detected session carry a **•**, the others are dimmed (still clickable).
+  ```lua
+  o.bind("SUPER + ALT + H", "Agent sessions", "omarchy-launch-tui --app-id=TUI.float ~/.config/omarchy/plugins/mst.agent-launchers/bin/agent-sessions")
+  ```
 
-Since 1.3.0 the widget is a single icon to save bar width on narrow/scaled screens (e.g. 2880×1800 at scale 2 = 1440 logical px).
+  Add `--lang de` or `--lang en` at the end to match a `language` setting of the widget. The script `bin/agent-sessions` can also be run directly in any terminal.
 
-## Hover tooltip / quota
+## Settings
 
-Hovering the icon shows, for all three agents:
+Optional, in the widget's entry in `~/.config/omarchy/shell.json`:
 
-- whether a resumable `~/Work` session was detected;
-- locally cached quota information when available;
-- the click actions (once, below the three agents).
-
-The plugin is deliberately **read-only** for quota checks. It does not read or print OAuth tokens and does not call a quota API itself.
-
-### Codex quota source
-
-It reads Omarchy's standard local usage record:
-
-`~/.local/state/omarchy/agents/usage/codex.json`
-
-This is the same kind of record used by Omarchy's Agents panel.
-
-### Agy quota sources
-
-It first looks for Omarchy-style records named `agy.json`, `antigravity.json`, or `gemini.json`, then for compatible local Agy usage/quota caches (including `~/.gemini/antigravity-cli/usage-limits.json`) and relevant non-secret Omarchy cache/state JSON files.
-
-This is designed to coexist with Agy/Gemini quota plugins such as the one already installed on the system. If no compatible cache is found, the tooltip simply says to use `/usage` inside Agy.
-
-### Claude quota source
-
-It reads Omarchy's standard local usage record:
-
-`~/.local/state/omarchy/agents/usage/claude.json`
-
-Claude therefore uses the same collector as Omarchy's built-in Agents panel. Until Claude is signed in and has recorded usage, the tooltip shows the collector's authentication status.
-
-## Session detection
-
-- Codex: reads recent `~/.codex/sessions/*/*/*/rollout-*.jsonl` metadata and looks for `cwd == ~/Work`.
-- Agy: reads the official workspace-keyed cache `~/.gemini/antigravity-cli/cache/last_conversations.json` and checks the `~/Work` entry.
-- Claude: checks Claude Code transcripts under `~/.claude/projects` for the `~/Work` workspace.
-
-## Safety / behavior
-
-- no automatic switching between agents;
-- does not change the Omarchy default agent;
-- does not pass `--dangerously-skip-permissions`;
-- quota status is refreshed from local files every 60 seconds and when hovering;
-- all agents always start in `~/Work`.
-
-## Install / update manually
-
-```bash
-mkdir -p ~/.config/omarchy/plugins
-rm -rf ~/.config/omarchy/plugins/mst.agent-launchers
-cp -a mst.agent-launchers ~/.config/omarchy/plugins/
-omarchy plugin validate ~/.config/omarchy/plugins/mst.agent-launchers
-omarchy-shell shell rescanPlugins
-omarchy plugin enable mst.agent-launchers
+```json
+{ "id": "mst.agent-launchers", "language": "de" }
 ```
 
-If version 1.0 is already enabled, replacing the files under the same plugin id normally hot-reloads it; a shell restart is only a fallback:
+`language`: `en`, `de`, or leave it out to follow the system language (`LC_ALL`, `LC_MESSAGES`, `LANG`; German for `de_*`, otherwise English).
+
+## Quota in the tooltip
+
+Hovering the icon shows, per agent, whether a resumable `~/Work` session was found and the locally cached quota:
+
+- Claude and Codex: Omarchy's own usage records `~/.local/state/omarchy/agents/usage/{claude,codex}.json` (the same collector as Omarchy's Agents panel).
+- Agy: Omarchy-style records (`agy.json`, `antigravity.json`, `gemini.json`), then compatible local caches such as `~/.gemini/antigravity-cli/usage-limits.json`. Without one, the tooltip points to `/usage` inside Agy.
+
+The plugin never reads or prints OAuth tokens and never calls a quota API itself.
+
+## Privacy and safety
+
+- **Read-only** on the agents' own files: `~/.claude/projects/*/*.jsonl` and `~/.claude/sessions/*.json` (or `$CLAUDE_CONFIG_DIR`), `~/.codex/session_index.jsonl` and the first lines of `~/.codex/sessions/**/rollout-*.jsonl`, Agy's `cache/conversation_metadata.json` and `cache/last_conversations.json`, `/proc` (which agent process is running, which window it belongs to). Never the `.key` files next to them. For the quota: the usage files listed above and JSON files named after Agy (`*agy*`, `*antigravity*`, `*gemini*`, never `*token*`, `*auth*`) below `~/.local/state/omarchy` and `~/.cache/omarchy`.
+- **No network, no service.** The status for the tooltip is refreshed from local files every 60 s; the session list only when you open the menu (~0.5 s) or the window.
+- **Index cache** `~/.cache/agent-sessions/index.json` for the window, mode 0600 because it contains prompt excerpts; it is rebuilt per file by mtime and size and can be deleted at any time.
+- Titles and texts are model output: control, C1, bidi and zero-width space characters are stripped before display, and the menu renders them as plain text.
+- Resuming only uses a checked session id (letters, digits, dashes) in an existing folder: the window starts it as an argument list without a shell and only for folders below `$HOME`; the menu runs a shell line with the folder quoted (`shlex.quote`). Sessions in `/tmp` (e.g. automated runs) and internal Codex runs are skipped.
+- No automatic agent switching, no change of the Omarchy default agent, no `--dangerously-skip-permissions`.
+- The transcript formats of the agents are undocumented and may change with updates; unexpected records are skipped instead of emptying the list.
+
+## Development
 
 ```bash
-omarchy restart shell
+python3 -m unittest discover -s tests
+omarchy plugin validate .
 ```
 
-## Remove
+After QML changes: `omarchy restart shell`. Screenshots: invented demo sessions; the window via `omarchy-launch-tui --app-id=TUI.float env HOME=<demo> … bin/agent-sessions --lang en` and `grim`; `menu.html` and `hero.html` rendered with a headless Chromium.
 
-```bash
-omarchy plugin disable mst.agent-launchers
-rm -rf ~/.config/omarchy/plugins/mst.agent-launchers
-omarchy-shell shell rescanPlugins
-```
+## Credits
+
+The *All sessions* window is based on the `claude-sitzungen` experiment by [bernhard2804](https://github.com/bernhard2804), proposed in [mstio/polaris-connector#3](https://github.com/mstio/polaris-connector/pull/3).
+
+## License
+
+[MIT](LICENSE)
