@@ -122,7 +122,7 @@ python3 -m unittest discover -s tests
 omarchy plugin validate .
 ```
 
-After QML changes: `omarchy restart shell`. Screenshots: invented demo sessions; the window via `omarchy-launch-tui --app-id=TUI.float env HOME=<demo> … bin/agent-sessions --lang en` and `grim`; `menu.html` and `hero.html` rendered with a headless Chromium.
+After QML changes: `omarchy restart shell`. Screenshots: invented demo sessions from `docs/screenshots/make-demo-home.py <demo-home>`; the window via `omarchy-launch-tui --app-id=TUI.float env HOME=<demo> … bin/agent-sessions --lang en` and `grim`; `menu.html` and `hero.html` rendered with a headless Chromium.
 
 ## Credits
 
