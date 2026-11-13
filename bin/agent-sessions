@@ -602,7 +602,7 @@ def oeffnen(sid, abzweig=False):
 
 def oberflaeche():
     if not shutil.which("fzf"):
-        print(tr("fzf fehlt (pacman -S fzf).", "fzf is missing (pacman -S fzf)."))
+        print(tr("fzf fehlt: bitte das Paket fzf installieren.", "fzf is missing: please install the fzf package."))
         time.sleep(3)
         return
     try:  # transform, Labels und wrap-word brauchen ein aktuelles fzf
