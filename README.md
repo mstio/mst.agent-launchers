@@ -2,17 +2,17 @@
 
 ![All your agent sessions, one click away](preview.png)
 
-One icon in the Omarchy bar for **Claude Code**, **Codex** and **Agy / Antigravity**: start an agent, resume a session, or find *any* earlier session across all folders – like the chat sidebar in Claude, but for your coding agents.
+One icon in the Omarchy bar for **Claude Code**, **Codex** and **Agy / Antigravity**: start an agent, resume a session, or find *any* earlier session across all folders – like the chat sidebar in Claude, but for your coding agents. The session window also lists **opencode** and, experimentally, **Copilot CLI**, **Pi**, **Gemini CLI** and **Grok**.
 
 - **Launch and resume** each agent from a small context menu.
 - **Running and recent sessions** per agent, with title, state and folder.
-- **All sessions …** opens a floating window with every session of all three agents: agent choice, filter, preview, search in the conversation content, and fork for a follow-up question (Claude).
+- **All sessions …** opens a floating window with every session of every agent found on the machine: agent choice, filter, preview, search in the conversation content, and fork for a follow-up question (Claude).
 - **Quota at a glance** in the tooltip, read from local usage records only.
 - English or German, following your system language.
 
 ## Why this one
 
-- **Search inside conversations, across agents.** Ctrl+S finds a word in the prompts and answers of your Claude, Codex and Agy sessions, not only in their titles, with a hit count per session.
+- **Search inside conversations, across agents.** Ctrl+S finds a word in the prompts and answers of your Claude, Codex, Agy and opencode sessions, not only in their titles, with a hit count per session.
 - **Never two clients on one transcript** (Claude, Codex): resuming a session that is already open focuses its window instead of starting it a second time.
 - **Fork instead of derail** (Claude): ask a side question in a copy of the session; the original stays untouched.
 - **Nothing running in the background.** No service, no network, no extra dependency besides `fzf`; it only reads the agents' own files when you open the menu or the window.
@@ -78,7 +78,15 @@ A small **•** on the icon means at least one agent has a resumable session in 
 
 ## All sessions
 
-The last menu row opens a floating terminal with all local sessions of all three agents, newest first: every session whose folder still exists below `$HOME` (for Claude: with at least one prompt of your own). The agent choice sits at the top of the window frame: **All · Claude · Codex · Agy**.
+The last menu row opens a floating terminal with all local sessions, newest first: every session whose folder still exists below `$HOME` (for Claude: with at least one prompt of your own). The agent choice sits at the top of the window frame: **All · Claude · Codex · Agy**, plus a tab for each further agent that has sessions on this machine.
+
+| Agent | List and resume | Preview with prompts and answer | Content search | Tested on real sessions |
+|---|---|---|---|---|
+| Claude Code, Codex, Agy | ✓ | ✓ | ✓ | ✓ |
+| opencode | ✓ (`opencode --session`) | ✓ | ✓ | ✓ |
+| Copilot CLI, Pi, Gemini CLI, Grok | ✓ (`copilot --resume`, `pi --session`, `gemini --resume`, `grok --resume`) | title, folder, last use | – | experimental |
+
+Experimental means: store locations and formats follow [omarchy-session-browser](https://github.com/Sudhanshugtm/omarchy-session-browser) and its test data, the resume flags were checked against the installed CLIs (Gemini CLI excepted), but no real session of these agents was available for testing. Reports with a sample are welcome.
 
 | Key | Effect |
 |---|---|
@@ -121,8 +129,8 @@ The plugin never reads or prints OAuth tokens and never calls a quota API itself
 
 ## Limitations
 
-- **Three agents:** Claude Code, Codex and Agy. Other agent CLIs (opencode, GitHub Copilot CLI, Gemini CLI, …) are not supported yet.
-- **Agy:** running sessions are not detected, so the menu cannot focus them; only some conversations keep a readable transcript, the others show title, folder and last use in the preview.
+- **Menu** covers Claude Code, Codex and Agy; further agents appear only in the window. Copilot CLI, Pi, Gemini CLI and Grok are experimental there (see the table under [All sessions](#all-sessions)); sessions whose id is shorter than 8 characters or contains other characters than letters, digits, `-` and `_` are skipped.
+- **Running sessions** are detected for Claude and Codex only; for the other agents Enter resumes even if the session is already open somewhere. Agy keeps a readable transcript only for some conversations.
 - **Fork** exists for Claude only.
 - **Focusing** needs one Hyprland window per session; inside tmux or another multiplexer you get a notification instead.
 - **Not listed:** sessions whose folder was deleted or lies outside `$HOME` or in `/tmp` (they cannot be resumed there), internal Codex runs, and Claude sessions without a prompt of your own.
@@ -150,6 +158,8 @@ The plugin only **reads**, and only these files:
 | Claude sessions | `~/.claude/projects/*/*.jsonl`, `~/.claude/sessions/*.json` (or below `$CLAUDE_CONFIG_DIR`) | menu, window |
 | Codex sessions | `~/.codex/session_index.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl` (first line for the lists, the whole file for preview and search) | menu, window |
 | Agy sessions | below `~/.gemini/antigravity-cli/`: `cache/conversation_metadata.json`, `cache/last_conversations.json`; for preview and search `brain/<id>/.system_generated/logs/transcript_full.jsonl` (or `transcript.jsonl`) | menu, window |
+| opencode sessions | `~/.local/share/opencode/opencode.db` (sessions without archived and sub-agent ones), opened read-only (`mode=ro`, `query_only`): the content is never changed, but like any reader SQLite may create or refresh its helper files `opencode.db-shm` / `-wal` | window |
+| Experimental agents | `~/.copilot/session-state/*/events.jsonl` and `history-session-state/*.json`, `~/.pi/agent/sessions/**/*.jsonl`, `~/.gemini/tmp/*/chats/session-*.json(l)` and `.project_root`, `~/.grok/sessions/*/*/summary.json` and `subagents/*/meta.json` (or below `$GROK_HOME`); event logs only their first lines, JSON files up to 2 MB (Gemini's older single-file form up to 20 MB) | window |
 | Running agents | `/proc`: which agent process runs and which window it belongs to | menu, window |
 | Quota | the usage files above; JSON files named after Agy (`*agy*`, `*antigravity*`, `*gemini*`, never `*token*`, `*auth*`, `*oauth*`, `*credential*`) below `~/.local/state/omarchy` and `~/.cache/omarchy` | tooltip, every 60 s |
 
@@ -171,6 +181,8 @@ After QML changes: `omarchy restart shell`. Screenshots: invented demo sessions 
 ## Credits
 
 The *All sessions* window is based on the `claude-sitzungen` experiment by [bernhard2804](https://github.com/bernhard2804), proposed in [mstio/polaris-connector#3](https://github.com/mstio/polaris-connector/pull/3).
+
+Where opencode, Copilot CLI, Pi, Gemini CLI and Grok keep their sessions, and how sub-agent sessions are marked, was learned from [omarchy-session-browser](https://github.com/Sudhanshugtm/omarchy-session-browser) by Sudhanshu Gautam (MIT); the code here is our own.
 
 ## License
 

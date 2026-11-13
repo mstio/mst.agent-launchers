@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -334,6 +335,197 @@ class ClaudeSitzungenTest(unittest.TestCase):
             self.m.oeffnen(ID_A)
             popen.assert_not_called()
             self.assertIn("address:0xabc", run.call_args[0][0][-1])
+
+
+
+class WeitereAgentenTest(unittest.TestCase):
+    """opencode (Struktur wie echte Datenbank) und experimentelle Agenten
+    (Formate nach Sudhanshugtm/omarchy-session-browser, MIT)."""
+
+    def setUp(self):
+        basis = os.environ.get("XDG_RUNTIME_DIR")
+        self.tmp = tempfile.TemporaryDirectory(dir=basis if basis and os.path.isdir(basis)
+                                               else Path(__file__).resolve().parent)
+        h = self.home = self.tmp.name
+        self.arbeit = a = os.path.join(h, "Arbeit")
+        os.makedirs(a)
+        # opencode: Tabellen session/message/part, Daten als JSON-Text, Zeit in ms
+        db = Path(h, ".local", "share", "opencode")
+        db.mkdir(parents=True)
+        con = sqlite3.connect(db / "opencode.db")
+        con.executescript(
+            "create table session (id text, title text, directory text, parent_id text, time_updated integer,"
+            " time_archived integer);"
+            "create table message (id text, session_id text, data text);"
+            "create table part (id text, message_id text, session_id text, time_created integer, data text);")
+        con.execute("insert into session values ('ses_abcdefgh12', 'Router einrichten', ?, null, 1793000000000, null)", (a,))
+        con.execute("insert into session values ('ses_kindkind12', 'Unteraufgabe', ?, 'ses_abcdefgh12', 1793000000000, null)", (a,))
+        con.execute("insert into session values ('-rf', 'Boese ID', ?, null, 1793000000000, null)", (a,))
+        con.execute("insert into session values ('ses_archiv1234', 'Archiviert', ?, null, 1793000000000, 1793000000001)", (a,))
+        for i, (rolle, teil) in enumerate([
+                ("user", {"type": "text", "text": "Wie richte ich den Router ein?"}),
+                ("user", {"type": "text", "text": "Zweiter Teil derselben Frage."}),
+                ("user", {"type": "text", "text": "Datei router.conf", "synthetic": True}),
+                ("assistant", {"type": "tool", "state": {"output": "router router"}}),
+                ("assistant", {"type": "text", "text": "Der Router ist eingerichtet.\x1b]0;x\x07"})]):
+            mid = "m0" if i in (0, 1, 2) else f"m{i}"  # Teile 0-2: eine Nutzernachricht
+            if i not in (1, 2):
+                con.execute("insert into message values (?, 'ses_abcdefgh12', ?)", (mid, json.dumps({"role": rolle})))
+            con.execute("insert into part values (?, ?, 'ses_abcdefgh12', ?, ?)",
+                        (f"p{i}", mid, 1793000000000 + i * 60000, json.dumps(teil)))
+        con.commit()
+        con.close()
+        # Copilot: Hauptsitzung und Unteragent
+        for sid, start in (("44444444-4444-4444-8444-444444444444", {"sessionId": "44444444-4444-4444-8444-444444444444", "context": {"cwd": a}}),
+                           ("55555555-5555-4555-8555-555555555555", {"sessionId": "55555555-5555-4555-8555-555555555555", "kind": "subagent", "context": {"cwd": a}})):
+            d = Path(h, ".copilot", "session-state", sid)
+            d.mkdir(parents=True)
+            (d / "events.jsonl").write_text(zeile(type="session.start", data=start)
+                                            + zeile(type="user.message", data={"content": "Copilot-Aufgabe"}))
+        # Pi: Kopfzeile mit id, Unteragent wird ausgelassen
+        pi = Path(h, ".pi", "agent", "sessions", "--arbeit--")
+        pi.mkdir(parents=True)
+        (pi / "a.jsonl").write_text(zeile(type="session", id="pi-sitzung-1", cwd=a)
+                                    + zeile(type="message", message={"role": "user", "content": "Pi-Aufgabe"}))
+        (pi / "b.jsonl").write_text(zeile(type="session", id="pi-kind-0001", cwd=a, kind="subagent"))
+        # Gemini CLI: Projektordner aus .project_root
+        g = Path(h, ".gemini", "tmp", "projekt")
+        (g / "chats").mkdir(parents=True)
+        (g / ".project_root").write_text(a)
+        (g / "chats" / "session-1.jsonl").write_text(
+            zeile(sessionId="66666666-6666-4666-8666-666666666666", projectHash="x")
+            + zeile(id="m1", type="user", content="Gemini-Aufgabe"))
+        # Grok: Unteragent ueber das Register des Elternteils
+        gs = Path(h, ".grok", "sessions", "%2Farbeit")
+        for sid, titel in (("99999999-9999-4999-8999-999999999999", "Grok-Aufgabe"),
+                           ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "Delegiert")):
+            (gs / sid).mkdir(parents=True)
+            (gs / sid / "summary.json").write_text(json.dumps(
+                {"info": {"id": sid, "cwd": a}, "generated_title": titel, "updated_at": "2026-11-01T10:00:00Z"}))
+        kind = gs / "99999999-9999-4999-8999-999999999999" / "subagents" / "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        kind.mkdir(parents=True)
+        (kind / "meta.json").write_text(json.dumps({"child_session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}))
+        with mock.patch.dict(os.environ, {"GROK_HOME": ""}):
+            self.m = lade(h)
+        w = mock.patch.object(self.m.shutil, "which", return_value="/usr/bin/x")
+        w.start()
+        self.addCleanup(w.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reiter_nur_fuer_vorhandene_agenten(self):
+        self.assertEqual(self.m.AGENTEN, ["alle", "claude", "codex", "agy", "opencode", "copilot", "pi", "gemini", "grok"])
+        leer = tempfile.TemporaryDirectory(dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+        self.addCleanup(leer.cleanup)
+        Path(leer.name, ".gemini", "tmp", "x", "chats").mkdir(parents=True)  # leerer Ordner zaehlt nicht
+        with mock.patch.dict(os.environ, {"GROK_HOME": ""}):
+            self.assertEqual(lade(leer.name).AGENTEN, ["alle", "claude", "codex", "agy"])
+
+    def test_listen_ohne_unteragenten_und_unzulaessige_ids(self):
+        erwartet = {"opencode": ["opencode:ses_abcdefgh12"],
+                    "copilot": ["copilot:44444444-4444-4444-8444-444444444444"],
+                    "pi": ["pi:pi-sitzung-1"],
+                    "gemini": ["gemini:66666666-6666-4666-8666-666666666666"],
+                    "grok": ["grok:99999999-9999-4999-8999-999999999999"]}
+        for a, schluessel in erwartet.items():
+            with self.subTest(agent=a):
+                self.assertEqual([z.split("\t")[0] for z in self.m.liste(a)], schluessel)
+        self.assertEqual(len(self.m.liste("alle")), 5)
+
+    def test_opencode_vorschau_und_suche(self):
+        with mock.patch("builtins.print") as p:
+            self.m.vorschau("opencode:ses_abcdefgh12")
+        aus = "\n".join(str(c[0][0]) if c[0] else "" for c in p.call_args_list)
+        for t in ("Wie richte ich den Router ein?\nZweiter Teil", "Der Router ist eingerichtet.", "\x1b[0m 1\n"):
+            self.assertIn(t, aus)
+        for t in ("router.conf", "\x1b]", "\x07"):
+            self.assertNotIn(t, aus)
+        _, t = self.m.inhaltssuche("router", "opencode")
+        self.assertEqual(t, {"opencode:ses_abcdefgh12": 2})  # Werkzeug und eingefuegte Dateien zaehlen nicht
+        _, t = self.m.inhaltssuche("aufgabe", "alle")  # experimentelle Agenten werden nicht durchsucht
+        self.assertEqual(t, {})
+
+    def test_experimentelle_vorschau_ohne_verlauf(self):
+        with mock.patch("builtins.print") as p:
+            self.m.vorschau("pi:pi-sitzung-1")
+        aus = "\n".join(str(c[0][0]) if c[0] else "" for c in p.call_args_list)
+        self.assertIn("Pi-Aufgabe", aus)
+        self.assertIn("experiment", aus)
+        self.assertNotIn("Prompts", aus)
+        self.assertNotIn("Eingaben", aus)
+
+    def test_fortsetzen_mit_argumentliste(self):
+        for schluessel, befehl in (
+                ("opencode:ses_abcdefgh12", ["opencode", "--session", "ses_abcdefgh12"]),
+                ("copilot:44444444-4444-4444-8444-444444444444", ["copilot", "--resume", "44444444-4444-4444-8444-444444444444"]),
+                ("pi:pi-sitzung-1", ["pi", "--session", "pi-sitzung-1"]),
+                ("gemini:66666666-6666-4666-8666-666666666666", ["gemini", "--resume", "66666666-6666-4666-8666-666666666666"]),
+                ("grok:99999999-9999-4999-8999-999999999999", ["grok", "--resume", "99999999-9999-4999-8999-999999999999"])):
+            with self.subTest(schluessel=schluessel), mock.patch.object(self.m.subprocess, "Popen") as popen:
+                self.m.oeffnen(schluessel)
+                args, kw = popen.call_args
+                self.assertEqual(args[0][-3:], befehl)
+                self.assertEqual(kw["cwd"], self.arbeit)
+        with mock.patch.object(self.m.subprocess, "Popen") as popen, mock.patch.object(self.m, "melden"):
+            self.m.oeffnen("opencode:-rf")
+            self.m.oeffnen("pi:../../etc")
+            self.m.oeffnen("copilot:55555555-5555-4555-8555-555555555555")  # Unteragent
+            popen.assert_not_called()
+
+    def test_kaputte_einzeldatei_leert_die_liste_nicht(self):
+        h = Path(self.home)
+        kaputt = [h / ".copilot" / "history-session-state" / "kaputt.json",
+                  h / ".gemini" / "tmp" / "projekt" / "chats" / "session-0.json",
+                  h / ".grok" / "sessions" / "%2Farbeit" / "00000000-0000-4000-8000-000000000000" / "summary.json",
+                  h / ".pi" / "agent" / "sessions" / "--arbeit--" / "0.jsonl"]
+        for f in kaputt:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text('{"halb geschrieben')
+        kaputt[-1].chmod(0)  # unlesbar (das Temp-Home loescht sie trotzdem)
+        self.assertEqual(len(self.m.liste("alle")), 5)
+
+    def test_alte_formen_abzweige_und_duplikate(self):
+        h, a = Path(self.home), self.arbeit
+        alt = h / ".copilot" / "history-session-state"
+        alt.mkdir(parents=True)
+        (alt / "copilot-alt-0001.json").write_text(json.dumps({"summary": "Alte Copilot-Aufgabe", "cwd": a}))
+        (alt / "copilot-alt-kind.json").write_text(json.dumps({"summary": "Kind", "kind": "subagent", "cwd": a}))
+        g = h / ".gemini" / "tmp" / "projekt" / "chats"
+        (g / "session-alt.json").write_text(json.dumps({"sessionId": "77777777-7777-4777-8777-777777777777",
+                                                        "messages": [{"role": "user", "content": [{"text": "Alte Gemini-Aufgabe"}]}]}))
+        # gleiche ID noch einmal, aelter: die neuere Datei gilt
+        (g / "session-2.jsonl").write_text(zeile(sessionId="66666666-6666-4666-8666-666666666666", projectHash="x")
+                                           + zeile(id="m1", type="user", content="Veraltet"))
+        os.utime(g / "session-2.jsonl", (1, 1))
+        gs = h / ".grok" / "sessions" / "%2Farbeit" / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        gs.mkdir(parents=True)
+        (gs / "summary.json").write_text(json.dumps({"info": {"id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "cwd": a},
+                                                     "generated_title": "Abzweig", "session_kind": "fork",
+                                                     "parent_session_id": "99999999-9999-4999-8999-999999999999"}))
+        cop = {z.split("\t")[0] for z in self.m.liste("copilot")}
+        self.assertEqual(cop, {"copilot:44444444-4444-4444-8444-444444444444", "copilot:copilot-alt-0001"})
+        gem = {z.split("\t")[0]: z for z in self.m.liste("gemini")}
+        self.assertEqual(set(gem), {"gemini:66666666-6666-4666-8666-666666666666", "gemini:77777777-7777-4777-8777-777777777777"})
+        self.assertIn("Gemini-Aufgabe", gem["gemini:66666666-6666-4666-8666-666666666666"])
+        self.assertIn("Alte Gemini-Aufgabe", gem["gemini:77777777-7777-4777-8777-777777777777"])
+        self.assertEqual(len(self.m.liste("grok")), 2)  # Abzweig des Nutzers bleibt sichtbar
+
+    def test_opencode_im_wal_modus_nur_lesend(self):
+        db = Path(self.home, ".local", "share", "opencode", "opencode.db")
+        con = sqlite3.connect(db)
+        con.execute("pragma journal_mode=wal")
+        con.execute("insert into session values ('ses_neu12345', 'Neu im WAL', ?, null, 1793000009000, null)", (self.arbeit,))
+        con.commit()  # Schreiber bleibt offen wie ein laufendes opencode
+        self.addCleanup(con.close)
+        vorher = db.read_bytes()
+        self.assertIn("opencode:ses_neu12345", [z.split("\t")[0] for z in self.m.liste("opencode")])
+        self.assertEqual(db.read_bytes(), vorher)  # Inhalt unveraendert
+
+    def test_kaputte_datenbank_leert_die_anderen_nicht(self):
+        Path(self.home, ".local", "share", "opencode", "opencode.db").write_bytes(b"kein sqlite")
+        self.assertEqual(self.m.liste("opencode"), [])
+        self.assertEqual(len(self.m.liste("alle")), 4)
 
 
 if __name__ == "__main__":

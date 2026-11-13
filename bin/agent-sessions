@@ -5,9 +5,11 @@ Urspruenglich von bernhard2804 als Experiment "claude-sitzungen" vorgeschlagen
 (mstio/polaris-connector#3); hier als Fenster "Alle Sitzungen ..." des
 Agenten-Starters (Menue bleibt schlank, volle Funktion im eigenen Fenster).
 
-Zeigt alle lokalen Sitzungen von Claude Code, Codex und Agy wie die
+Zeigt alle lokalen Sitzungen von Claude Code, Codex und Agy (dazu opencode
+und experimentell Copilot, Pi, Gemini CLI, Grok, sofern vorhanden) wie die
 Seitenleiste von Claude Chat: neueste oben, Agentenwahl oben im Rahmen
-(Tab/Shift+Tab), Vorschau und Inhaltssuche fuer alle drei, fuer Claude
+(Tab/Shift+Tab), Vorschau und Inhaltssuche fuer Claude, Codex, Agy und
+opencode, fuer Claude
 zusaetzlich Abzweig (claude --resume --fork-session). Enter setzt eine
 Sitzung in einem neuen Terminalfenster fort. Terminal-Oberflaeche mit fzf.
 
@@ -23,7 +25,9 @@ Liest nur: $CLAUDE_CONFIG_DIR (Standard ~/.claude) projects/*/*.jsonl und
 sessions/*.json; Codex/Agy-Liste ueber bin/agent-launcher-status, fuer
 Vorschau und Suche die Codex-Rollouts (~/.codex/sessions) und die
 Agy-Verlaeufe (~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/
-transcript_full.jsonl bzw. transcript.jsonl). Zwischenspeicher
+transcript_full.jsonl bzw. transcript.jsonl), opencode (~/.local/share/opencode/
+opencode.db, nur lesend) und die Ablagen von Copilot, Pi, Gemini CLI und Grok
+(siehe WEITERE und SCANNER). Zwischenspeicher
 $XDG_CACHE_HOME/agent-sessions/index.json (wegwerfbar, nur fuer den Nutzer
 lesbar: enthaelt Gespraechsauszuege). Kein Hintergrunddienst, kein Timer, kein Netz.
 Abhaengigkeiten: python3, fzf; optional rg (schnellere Inhaltssuche),
@@ -34,9 +38,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 from datetime import date, datetime, timedelta
 
 HOME = os.path.expanduser("~")
@@ -94,8 +100,42 @@ CODEX_INTERN = ("<environment_context", "<user_instructions", "# AGENTS.md instr
 AGY_FRAGE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
 
 
-AGENTEN = ["alle", "claude", "codex", "agy"]
+# Weitere Agenten, nur im Fenster (das Menue bleibt bei Claude, Codex, Agy).
+# Ablageorte und Formate teils nach Sudhanshugtm/omarchy-session-browser (MIT).
+# opencode ist an echten Sitzungen geprueft (Liste, Vorschau, Suche); die
+# uebrigen nur an Beispielen: experimentell, Liste und Fortsetzen.
+OPENCODE_DB = os.path.join(HOME, ".local", "share", "opencode", "opencode.db")
+COPILOT = os.path.join(HOME, ".copilot")
+PI = os.path.join(HOME, ".pi", "agent", "sessions")
+GEMINI_TMP = os.path.join(HOME, ".gemini", "tmp")
+GROK = os.path.expanduser(os.environ.get("GROK_HOME") or os.path.join(HOME, ".grok"))
+WEITERE = {  # Agent: (Anzeigename, Befehl zum Fortsetzen ohne ID, an echten Sitzungen geprueft)
+    "opencode": ("opencode", ["opencode", "--session"], True),
+    "copilot": ("Copilot", ["copilot", "--resume"], False),
+    "pi": ("Pi", ["pi", "--session"], False),
+    "gemini": ("Gemini", ["gemini", "--resume"], False),
+    "grok": ("Grok", ["grok", "--resume"], False),
+}
+ID_WEITERE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{7,79}")  # nur fullmatch: kein "-" vorn, kein "/" oder "."
+
+
+def _vorhanden(agent):
+    """Reiter nur fuer Agenten, die hier Sitzungsdateien haben (billig: stat/glob,
+    leere Ordner zaehlen nicht)."""
+    if agent == "opencode":
+        return os.path.isfile(OPENCODE_DB)
+    muster = {"copilot": [os.path.join(COPILOT, "session-state", "*", "events.jsonl"),
+                          os.path.join(COPILOT, "history-session-state", "*.json")],
+              "pi": [os.path.join(PI, "*", "*.jsonl"), os.path.join(PI, "*.jsonl")],
+              "gemini": [os.path.join(GEMINI_TMP, "*", "chats", "session-*.json*")],
+              "grok": [os.path.join(GROK, "sessions", "*", "*", "summary.json")]}[agent]
+    return any(next(glob.iglob(m), None) for m in muster)
+
+
+AGENTEN = ["alle", "claude", "codex", "agy"] + [a for a in WEITERE if _vorhanden(a)]
 def name(agent):
+    if agent in WEITERE:
+        return WEITERE[agent][0]
     return {"alle": tr("Alle", "All"), "claude": "Claude", "codex": "Codex", "agy": "Agy"}[agent]
 
 
@@ -386,7 +426,18 @@ def titel(e):
 
 
 def andere(agent):
-    """Codex- bzw. Agy-Sitzungen (alle, ohne Zeitgrenze) aus agent-launcher-status."""
+    """Sitzungen eines Agenten ausser Claude (alle, ohne Zeitgrenze): Codex und
+    Agy aus agent-launcher-status, die weiteren aus den eigenen Scannern."""
+    if agent in WEITERE:
+        neueste = {}
+        try:
+            for i in SCANNER[agent]():
+                alt = neueste.get(i["id"])
+                if ID_WEITERE.fullmatch(i["id"]) and (alt is None or i["updated"] > alt["updated"]):
+                    neueste[i["id"]] = i  # gleiche ID mehrfach: die neueste gilt
+        except Exception:
+            pass  # Datenbank gesperrt oder kaputt: was bis dahin gelesen ist, bleibt
+        return [i for i in neueste.values() if ordner_zulaessig(i["path"])]
     if STATUS is None:
         return []
     try:
@@ -398,6 +449,264 @@ def andere(agent):
         return []
     return [i for i in items if isinstance(i, dict) and STATUS.SAFE_ID.fullmatch(str(i.get("id", "")))
             and ordner_zulaessig(str(i.get("path", "")))]
+
+
+def andere_agenten(agent):
+    """Agenten ausser Claude, die fuer die Ansicht gelesen werden."""
+    return [a for a in AGENTEN[2:] if agent in ("alle", a)]
+
+
+def _sek(t):
+    """Zeitstempel in Sekunden (Millisekunden, Sekunden oder ISO-Text)."""
+    if isinstance(t, str):
+        return zeitstempel(t) or 0.0
+    try:
+        v = float(t or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return v / 1000 if v > 1e12 else v
+
+
+def _mtime(pfad):
+    try:
+        return os.stat(pfad).st_mtime
+    except OSError:
+        return 0.0
+
+
+def _unteragent(d):
+    """Ausdrueckliche Kennzeichen von Unteragenten (keine Raterei an IDs)."""
+    if not isinstance(d, dict):
+        return False
+    art = _str(d.get("kind") or d.get("session_kind") or d.get("thread_source")).lower()
+    return d.get("isSubagent") is True or d.get("is_subagent") is True or art.startswith(("subagent", "sub-agent"))
+
+
+def _kopf(pfad, n):
+    """Die ersten n JSON-Objekte einer JSONL-Datei."""
+    aus = []
+    with open(pfad, encoding="utf-8", errors="replace") as f:
+        for _ in range(n):
+            zeile = f.readline(262144)
+            if not zeile:
+                break
+            try:
+                r = json.loads(zeile)
+            except Exception:
+                continue
+            if isinstance(r, dict):
+                aus.append(r)
+    return aus
+
+
+def _json(pfad, max_bytes=2_000_000):
+    if os.path.getsize(pfad) > max_bytes:
+        return None
+    with open(pfad, encoding="utf-8", errors="replace") as f:
+        d = json.load(f)
+    return d if isinstance(d, dict) else None
+
+
+def _text(c):
+    """Lesbarer Text aus den gaengigen Formen (Text, Liste von Teilen mit
+    "text", auch ohne "type"); eingeschobene Bloecke wie <context> nicht."""
+    if isinstance(c, list):
+        c = "".join(x if isinstance(x, str) else _str(x.get("text")) if isinstance(x, dict) else "" for x in c)
+    t = _str(c).strip()
+    return "" if t.startswith("<") else t
+
+
+def _je_datei(muster, lesen, rekursiv=False):
+    """lesen(pfad) fuer jede Datei; eine kaputte, halb geschriebene oder
+    unlesbare Datei faellt allein weg, nicht die ganze Liste."""
+    for f in glob.glob(muster, recursive=rekursiv):
+        try:
+            e = lesen(f)
+        except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+            continue
+        if e:
+            yield e
+
+
+def _sqlite(pfad):
+    # mode=ro aendert den Inhalt nie; im WAL-Modus kann SQLite aber die
+    # Hilfsdateien -shm/-wal anlegen bzw. auffrischen (wie jeder Leser).
+    con = sqlite3.connect("file:" + urllib.parse.quote(pfad) + "?mode=ro", uri=True, timeout=0.5)
+    con.execute("pragma query_only = on")
+    return con
+
+
+def _eintrag(agent, sid, titel_, cwd, zeit):
+    return {"agent": agent, "id": _str(sid), "title": _str(titel_), "path": _str(cwd),
+            "updated": zeit, "active": False}
+
+
+def _scan_opencode():
+    con = _sqlite(OPENCODE_DB)
+    try:
+        sql = "select id, title, directory, time_updated from session where parent_id is null"
+        try:  # archivierte Sitzungen blendet opencode selbst aus
+            rows = con.execute(sql + " and time_archived is null").fetchall()
+        except sqlite3.OperationalError:  # aeltere Datenbank ohne die Spalte
+            rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    for sid, t, d, zeit in rows:
+        yield _eintrag("opencode", sid, t, d, _sek(zeit))
+
+
+def _copilot_neu(f):
+    sid, titel_, cwd, start, kind = os.path.basename(os.path.dirname(f)), "", "", False, False
+    for r in _kopf(f, 200):
+        d = r.get("data") if isinstance(r.get("data"), dict) else {}
+        ctx = d.get("context") if isinstance(d.get("context"), dict) else {}
+        if r.get("type") == "session.start":
+            start = True
+            sid = d.get("sessionId") or sid
+            cwd = ctx.get("cwd") or d.get("cwd") or cwd
+            titel_ = _str(d.get("name")) or titel_
+            kind = _unteragent(d) or _unteragent(ctx) or bool(d.get("parentSessionId") or ctx.get("parentSessionId"))
+        elif r.get("type") == "user.message" and not titel_:
+            titel_ = _text(d.get("content"))
+        elif r.get("type") == "session.task_complete" and not titel_:
+            titel_ = _str(d.get("summary"))
+        if kind or (start and titel_):
+            break
+    return _eintrag("copilot", sid, titel_, cwd, _mtime(f)) if start and not kind else None
+
+
+def _copilot_alt(f):  # Ablage vor Copilot CLI 0.0.342
+    d = _json(f)
+    if not d or _unteragent(d) or d.get("parentSessionId"):
+        return None
+    ctx = d.get("context") if isinstance(d.get("context"), dict) else {}
+    return _eintrag("copilot", os.path.basename(f)[:-5], d.get("summary") or d.get("title"),
+                    d.get("cwd") or ctx.get("cwd"), _mtime(f))
+
+
+def _scan_copilot():
+    yield from _je_datei(os.path.join(COPILOT, "session-state", "*", "events.jsonl"), _copilot_neu)
+    yield from _je_datei(os.path.join(COPILOT, "history-session-state", "*.json"), _copilot_alt)
+
+
+def _pi(f):
+    kopf, titel_ = None, ""
+    for r in _kopf(f, 30):
+        if r.get("type") == "session" and kopf is None:
+            kopf = r
+        m = r.get("message") if isinstance(r.get("message"), dict) else {}
+        if m.get("role") == "user" and not titel_:
+            titel_ = _text(m.get("content"))
+        if kopf is not None and titel_:
+            break
+    return _eintrag("pi", kopf.get("id"), titel_, kopf.get("cwd"), _mtime(f)) \
+        if kopf and not _unteragent(kopf) else None
+
+
+def _scan_pi():
+    yield from _je_datei(os.path.join(PI, "**", "*.jsonl"), _pi, rekursiv=True)
+
+
+def _gemini(f):
+    meta, nachr = {}, []
+    if f.endswith(".jsonl"):
+        for r in _kopf(f, 200):
+            if isinstance(r.get("$set"), dict):
+                meta.update(r["$set"])
+            elif r.get("sessionId") and r.get("projectHash"):
+                meta.update(r)
+                nachr += r.get("messages") if isinstance(r.get("messages"), list) else []
+            elif r.get("type"):
+                nachr.append(r)
+    else:
+        meta = _json(f, 20_000_000) or {}  # alte Form: ganze Sitzung in einer Datei
+        nachr = meta.get("messages") or meta.get("history") or []
+    if not meta.get("sessionId") or _unteragent(meta) or meta.get("parentSessionId"):
+        return None
+    titel_ = _str(meta.get("summary"))
+    for m in nachr if isinstance(nachr, list) else []:
+        if not titel_ and isinstance(m, dict) and (m.get("type") or m.get("role")) == "user":
+            titel_ = _text(m.get("content"))
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(f)), ".project_root"),
+                  encoding="utf-8", errors="replace") as h:
+            cwd = h.read(4096).strip()
+    except OSError:
+        cwd = ""
+    ordner = meta.get("directories")
+    if not cwd and isinstance(ordner, list) and ordner:
+        cwd = _str(ordner[0])
+    return _eintrag("gemini", meta["sessionId"], titel_, cwd or HOME, _mtime(f))
+
+
+def _scan_gemini():
+    yield from _je_datei(os.path.join(GEMINI_TMP, "*", "chats", "session-*.json*"), _gemini)
+
+
+def _scan_grok():
+    kinder = set()
+
+    def kind(f):
+        d = _json(f) or {}
+        return [os.path.basename(os.path.dirname(f))] + \
+            [d.get(k) for k in ("child_session_id", "session_id", "subagent_id", "id") if isinstance(d.get(k), str)]
+    for ids in _je_datei(os.path.join(GROK, "sessions", "*", "*", "subagents", "*", "meta.json"), kind):
+        kinder.update(ids)
+
+    def sitzung(f):
+        d = _json(f)
+        info = d.get("info") if d and isinstance(d.get("info"), dict) else {}
+        sid = _str(info.get("id")) or os.path.basename(os.path.dirname(f))
+        # parent_session_id ist kein Kennzeichen: Grok setzt es auch bei Abzweigen des Nutzers.
+        if not d or sid in kinder or _unteragent(d) or d.get("hidden") is True:
+            return None
+        titel_ = d.get("generated_title") or d.get("session_summary") or d.get("last_turn_summary")
+        return _eintrag("grok", sid, titel_, info.get("cwd"), _sek(d.get("updated_at")) or _mtime(f))
+    yield from _je_datei(os.path.join(GROK, "sessions", "*", "*", "summary.json"), sitzung)
+
+
+SCANNER = {"opencode": _scan_opencode, "copilot": _scan_copilot, "pi": _scan_pi,
+           "gemini": _scan_gemini, "grok": _scan_grok}
+
+
+def opencode_texte(sids, filt=None):
+    """{Sitzung: [(rolle, text, zeit)]} aus der opencode-Datenbank, eine
+    Verbindung fuer alle Sitzungen. Nur Textteile (keine Werkzeuge, keine
+    eingefuegten Dateien); Teile derselben Nachricht werden eine Nachricht."""
+    sids = list(sids)
+    aus = {s: [] for s in sids}
+    if not sids:
+        return aus
+    con = _sqlite(OPENCODE_DB)
+    try:
+        rows = con.execute(
+            "select p.session_id, p.message_id, m.data, p.data, p.time_created from part p"
+            " join message m on m.id = p.message_id where p.session_id in (%s)"
+            " and p.data like '%%\"text\"%%' order by p.session_id, p.time_created, p.id"
+            % ",".join("?" * len(sids)), sids).fetchall()
+    finally:
+        con.close()
+    letzte = {}
+    for sid, mid, md, pd, zeit in rows:
+        if not isinstance(pd, str) or (filt and not filt(pd)):
+            continue
+        try:
+            m, p = json.loads(md), json.loads(pd)
+        except Exception:
+            continue
+        if not isinstance(m, dict) or not isinstance(p, dict) or p.get("type") != "text" \
+                or p.get("synthetic") or p.get("ignored"):
+            continue
+        rolle, t = m.get("role"), _str(p.get("text")).strip()
+        if rolle not in ("user", "assistant") or not t:
+            continue
+        if letzte.get(sid) == mid:  # weiterer Textteil derselben Nachricht
+            r, alt, z = aus[sid][-1]
+            aus[sid][-1] = (r, alt + "\n" + t, z)
+        else:
+            aus[sid].append((rolle, t, _sek(zeit) or None))
+            letzte[sid] = mid
+    return aus
 
 
 def _claude_zeile(e, auf):
@@ -423,7 +732,7 @@ def _formatieren(zeilen_, treffer=None, mit_agent=False):
     aus = []
     for r in zeilen_:
         mark = "●" if r["aktiv"] else " "
-        wer = f"\x1b[2m{name(r['agent']):<7}\x1b[0m" if mit_agent else ""
+        wer = f"\x1b[2m{name(r['agent']):<8}\x1b[0m " if mit_agent else ""
         extra = f"  [{treffer[r['key']]}×]" if treffer else ""
         ordner = "" if r["cwd"] == haupt else f"  \x1b[2m{kurz(sauber(ordner_kurz(r['cwd'])), 30)}\x1b[0m"
         aus.append(f"{r['key']}\t{tag(r['ende'])} {mark} {wer}{kurz(sauber(r['titel']), 60)}{extra}{ordner}")
@@ -436,9 +745,8 @@ def liste(agent="alle"):
     if agent in ("alle", "claude"):
         auf = offene()
         r += [_claude_zeile(e, auf) for e in index()]
-    for a in ("codex", "agy"):
-        if agent in ("alle", a):
-            r += [_andere_zeile(i) for i in andere(a)]
+    for a in andere_agenten(agent):
+        r += [_andere_zeile(i) for i in andere(a)]
     return _formatieren(r, mit_agent=(agent == "alle"))
 
 
@@ -472,6 +780,16 @@ def datei_andere(i):
     return None
 
 
+def verlauf(i, filt=None):
+    """(rolle, text, zeit) einer Sitzung ausser Claude; None ohne lesbaren Verlauf."""
+    if i["agent"] == "opencode":
+        return opencode_texte([i["id"]], filt)[i["id"]]
+    if i["agent"] in ("codex", "agy"):
+        d = datei_andere(i)
+        return NACHRICHTEN[i["agent"]](d, filt) if d else None
+    return None  # experimentelle Agenten: nur Liste und Fortsetzen
+
+
 def _kandidaten(muster, dateien):
     """Dateien, die eines der Muster enthalten (rg); ohne rg alle."""
     if shutil.which("rg") and dateien:
@@ -497,8 +815,11 @@ def inhaltssuche(q, agent="alle"):
     if agent in ("alle", "claude"):
         auf = offene()
         quellen += [(_claude_zeile(e, auf), "claude", e["pfad"]) for e in index() if e.get("pfad")]
-    for a in ("codex", "agy"):
-        if agent in ("alle", a):
+    direkt = []  # ohne Datei-Vorfilter (Datenbank)
+    for a in andere_agenten(agent):
+        if a == "opencode":
+            direkt = andere(a)
+        elif a in ("codex", "agy"):
             for i in andere(a):
                 d = datei_andere(i)
                 if d:
@@ -525,6 +846,16 @@ def inhaltssuche(q, agent="alle"):
         except Exception:  # eine kaputte Datei soll die Trefferliste nicht leeren
             continue
         if n:
+            treffer[z["key"]] = n
+            gefunden.append(z)
+    try:
+        texte = opencode_texte([i["id"] for i in direkt], filt)
+    except Exception:  # Datenbank gesperrt oder kaputt
+        texte = {}
+    for i in direkt:
+        n = sum(t.lower().count(ql) for _, t, _ in texte.get(i["id"], []))
+        if n:
+            z = _andere_zeile(i)
             treffer[z["key"]] = n
             gefunden.append(z)
     return gefunden, treffer
@@ -560,7 +891,7 @@ def letzte_antwort(pfad):
 
 def _andere_finden(schluessel):
     agent, _, sid = (schluessel or "").partition(":")
-    if agent not in ("codex", "agy"):
+    if agent not in AGENTEN[2:]:
         return None
     return next((i for i in andere(agent) if i["id"] == sid), None)
 
@@ -578,8 +909,8 @@ def _vorschau_drucken(titel_, agent, cwd, e, offen):
 
     print(B + sauber(titel_) + N)
     wer = "" if agent == "claude" else f"{D}Agent:{N} {name(agent)}   "
-    print(f"{wer}{D}{tr('Ordner', 'Folder')}:{N} {sauber(ordner_kurz(cwd))}   "
-          f"{D}{tr('Eingaben', 'Prompts')}:{N} {e['fragen']}")
+    zahl = "" if e["fragen"] is None else f"   {D}{tr('Eingaben', 'Prompts')}:{N} {e['fragen']}"
+    print(f"{wer}{D}{tr('Ordner', 'Folder')}:{N} {sauber(ordner_kurz(cwd))}{zahl}")
     von = datetime.fromtimestamp(e["beginn"]).strftime(ZEITFORMAT()) if e["beginn"] else "?"
     bis = datetime.fromtimestamp(e["ende"]).strftime(ZEITFORMAT()) if e["ende"] else "?"
     print(f"{D}{tr('Zeitraum', 'Period')}:{N} {von} - {bis}")
@@ -605,17 +936,25 @@ def vorschau_andere(schluessel):
         print(tr("Sitzung nicht gefunden.", "Session not found."))
         return
     e = {"fragen": 0, "erste": "", "letzte": "", "antwort": "", "beginn": None, "ende": None}
-    d = datei_andere(i)
-    if d:
-        try:
-            e = zusammenfassen(NACHRICHTEN[i["agent"]](d))
-        except Exception:
-            d = None
+    try:
+        v = verlauf(i)
+    except Exception:
+        v = None
+    if v:
+        e = zusammenfassen(v)
+    else:
+        e["fragen"] = None  # ohne Verlauf keine Zahl anzeigen
     if not e["ende"]:
         e["ende"] = float(i.get("updated") or 0) or None
     _vorschau_drucken(str(i.get("title") or tr("(ohne Titel)", "(untitled)")), i["agent"],
                       str(i["path"]), e, bool(i.get("active")))
-    if not d or not e["fragen"]:
+    if i["agent"] in WEITERE and not WEITERE[i["agent"]][2]:
+        print()
+        print("\x1b[2m" + tr(f"{name(i['agent'])} ist experimentell: Liste und Fortsetzen, "
+                              "noch ohne Verlauf in der Vorschau und ohne Inhaltssuche.",
+                              f"{name(i['agent'])} is experimental: list and resume, "
+                              "no transcript preview or content search yet.") + "\x1b[0m")
+    elif not v or not e["fragen"]:
         print()
         print("\x1b[2m" + tr("Kein lesbarer Verlauf gefunden.", "No readable transcript found.") + "\x1b[0m")
 
@@ -697,7 +1036,10 @@ def oeffnen_andere(schluessel, abzweig=False):
             melden(tr("Diese Sitzung ist schon offen, ihr Fenster wurde nicht gefunden.",
                       "This session is already open, but its window was not found."), True)
         return
-    befehl = ["codex", "resume", i["id"]] if i["agent"] == "codex" else ["agy", "--conversation", i["id"]]
+    if i["agent"] in WEITERE:
+        befehl = WEITERE[i["agent"]][1] + [i["id"]]
+    else:
+        befehl = ["codex", "resume", i["id"]] if i["agent"] == "codex" else ["agy", "--conversation", i["id"]]
     starten(befehl, i["path"])
 
 
