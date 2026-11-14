@@ -556,10 +556,13 @@ class KennzahlenTest(unittest.TestCase):
             zeile(type="assistant", cwd=a, timestamp="2026-11-01T10:02:00Z", isSidechain=True,
                   message={"id": "s1", "model": "claude-y", "usage": u2, "content": []}),
             zeile(type="system", subtype="turn_duration", durationMs=True),  # Unsinn ignorieren
+            # Abbruch ohne echte Anfrage: Kontext bleibt
+            zeile(type="assistant", cwd=a, timestamp="2026-11-01T10:03:00Z",
+                  message={"id": "x1", "model": "<synthetic>", "usage": {"input_tokens": 0}, "content": []}),
         ])
         e = self.m.auswerten(next(Path(self.home, ".claude", "projects").glob("*/*.jsonl")))
         self.assertEqual(e["tok"], {"ein": 1015 + 2020, "cache": 3000, "aus": 37})
-        self.assertEqual(e["ctx"], 1015)  # Nebenkette (Unteragent) zaehlt nicht zum Kontext
+        self.assertEqual(e["ctx"], 1022)  # Eingabe + Ausgabe; Nebenkette zaehlt nicht zum Kontext
         self.assertEqual(e["modell"], "claude-x")
         self.assertEqual(e["arbeit_s"], 90)
 
@@ -592,7 +595,7 @@ class KennzahlenTest(unittest.TestCase):
         d = self._codex([zeile(type="PLANNER_RESPONSE", input_tokens=100, cache_read_tokens=0, output_tokens=5),
                          zeile(type="PLANNER_RESPONSE", input_tokens=10, cache_read_tokens=200, output_tokens=6)])
         m = self.m.metrik_agy(d)
-        self.assertEqual((m["ctx"], m["tok"]), (210, {"ein": 310, "cache": 200, "aus": 11}))
+        self.assertEqual((m["ctx"], m["tok"]), (216, {"ein": 310, "cache": 200, "aus": 11}))
 
     def test_remote_markierung_und_kontext_in_der_zeile(self):
         z = self.m._formatieren([
@@ -605,9 +608,38 @@ class KennzahlenTest(unittest.TestCase):
 
     def test_kurzformen(self):
         with mock.patch.dict(os.environ, {"AGENT_LAUNCHERS_LANG": "de"}):
-            self.assertEqual([self.m.kzahl(n) for n in (850, 182_400, 4_120_000)], ["850", "182k", "4,1 M"])
+            self.assertEqual([self.m.kzahl(n) for n in (850, 182_400, 999_600, 4_120_000)],
+                             ["850", "182k", "1,0 M", "4,1 M"])
             self.assertEqual([self.m.dauer(s) for s in (30, 600, 7500, 90000)],
                              ["< 1 min", "10 min", "2 h 05 min", "1 T 1 h"])
+
+    def test_codex_resume_setzt_summe_zurueck(self):
+        tc = lambda ein, ts: zeile(timestamp=ts, type="event_msg", payload={"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": ein, "cached_input_tokens": 0, "output_tokens": 1},
+            "last_token_usage": {"total_tokens": 5}}})
+        d = self._codex([tc(1000, "2026-11-01T10:00:00Z"), tc(3000, "2026-11-01T10:01:00Z"),
+                         tc(200, "2026-11-02T10:00:00Z")])  # nach "codex resume" wieder ab 0
+        self.assertEqual(self.m.metrik_codex(d, voll=True)["tok"], {"ein": 3200, "cache": 0, "aus": 2})
+
+    def test_unsinnige_zahlen_leeren_nichts(self):
+        self.assertEqual([self.m._int(v) for v in (float("inf"), float("nan"), -5, "7", True, 10**400)],
+                         [0, 0, 0, 0, 0, 10**15])
+        self.assertTrue(self.m._formatieren([{"key": "a", "agent": "claude", "ende": 1.0, "titel": "T",
+                                              "cwd": "/x", "aktiv": False, "ctx": "kaputt"}]))
+
+    def test_metrik_cache_haelt_beide_agenten_und_ist_privat(self):
+        c = self._codex([zeile(type="event_msg", payload={"type": "token_count", "info": {
+            "total_token_usage": {}, "last_token_usage": {"total_tokens": 70}}})])
+        g = Path(self.home, "agy.jsonl")
+        g.write_text(zeile(type="PLANNER_RESPONSE", input_tokens=1, cache_read_tokens=2, output_tokens=3))
+        self.assertEqual(self.m.metriken([("codex", c), ("agy", str(g))]), {c: 70, str(g): 6})
+        with open(self.m.METRIK_CACHE) as f:
+            e = json.load(f)["e"]
+        self.assertEqual(set(e), {c, str(g)})
+        self.assertEqual(set(e[c]), {"k", "ctx"})  # nur Schluessel und Zahl
+        self.assertEqual(os.stat(self.m.METRIK_CACHE).st_mode & 0o777, 0o600)
+        Path(self.m.METRIK_CACHE).write_text('{"v":2,"e":[]}')  # kaputt: neu aufbauen statt abbrechen
+        self.assertEqual(self.m.metriken([("codex", c)]), {c: 70})
 
 
 if __name__ == "__main__":

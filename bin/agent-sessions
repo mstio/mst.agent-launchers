@@ -35,6 +35,7 @@ hyprctl (Fokus auf schon offene Sitzung), uwsm-app + xdg-terminal-exec (Omarchy)
 """
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -204,7 +205,11 @@ def _str(v):
 
 def _int(v):
     """Nichtnegative Zahl aus undokumentierten Feldern, sonst 0."""
-    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else 0
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+        return 0
+    if isinstance(v, float) and not math.isfinite(v):
+        return 0
+    return min(int(v), 10**15)  # kaputte Riesenzahlen sollen die Anzeige nicht sprengen
 
 
 def auswerten(pfad):
@@ -239,10 +244,12 @@ def auswerten(pfad):
                     werte = (_int(u.get("input_tokens")), _int(u.get("cache_read_input_tokens")),
                              _int(u.get("cache_creation_input_tokens")), _int(u.get("output_tokens")))
                     nutzung[_str(m.get("id")) or _str(r.get("uuid")) or str(len(nutzung))] = werte
-                    if not r.get("isSidechain"):
-                        d["ctx"] = werte[0] + werte[1] + werte[2]  # Kontext der letzten Anfrage
-                        mod = _str(m.get("model"))
-                        if mod and not mod.startswith("<"):  # "<synthetic>" = keine echte Antwort
+                    mod = _str(m.get("model"))
+                    # "<synthetic>" = Abbruch/Fehler ohne echte Anfrage: Kontext nicht auf 0 setzen
+                    if not r.get("isSidechain") and not mod.startswith("<"):
+                        # Kontext = Gespraech nach der letzten Antwort (wie Codex total_tokens)
+                        d["ctx"] = sum(werte)
+                        if mod:
                             d["modell"] = mod[:60]
                 if r.get("isSidechain"):
                     continue
@@ -273,21 +280,30 @@ def _ende_lesen(pfad, n):
         f.seek(0, 2)
         groesse = f.tell()
         f.seek(max(0, groesse - n))
-        z = f.read().decode("utf-8", "replace").splitlines()
+        z = f.read().decode("utf-8", "replace").split("\n")  # nicht splitlines: U+2028 in JSON
     return z if groesse <= n else z[1:]
+
+
+def _zeilen(pfad):
+    with open(pfad, encoding="utf-8", errors="replace", newline="") as f:
+        yield from f
 
 
 def metrik_codex(pfad, voll=False):
     """Tokens, Kontext, Modell (und mit voll Agentenzeit) einer Codex-Sitzung.
     Ohne voll nur das Dateiende: das letzte token_count genuegt fuer Kontext und Summe."""
+    if not voll:
+        m = _metrik_codex_lauf(_ende_lesen(pfad, 262_144), False)
+        if m["ctx"]:
+            return m
+        voll = True  # nichts Brauchbares im Ende: ganze Datei
+    return _metrik_codex_lauf(_zeilen(pfad), voll)
+
+
+def _metrik_codex_lauf(zeilen, voll):
     m = {"ctx": 0, "fenster": 0, "modell": "", "tok": None, "arbeit_s": None}
-    zeilen = None if voll else _ende_lesen(pfad, 262_144)
-    if zeilen is not None and not any('"token_count"' in z for z in zeilen):
-        zeilen = None  # nichts im Ende: ganze Datei
-    if zeilen is None:
-        with open(pfad, encoding="utf-8", errors="replace") as f:
-            zeilen = f.read().splitlines()
-        voll = True
+    # Nach "codex resume" beginnt total_token_usage wieder bei 0: Ruecksprung = neuer Abschnitt
+    basis, vorher = {"ein": 0, "cache": 0, "aus": 0}, None
     start, arbeit = None, 0.0
     for z in zeilen:
         if not any(k in z for k in ('"token_count"', '"turn_context"', '"task_started"',
@@ -308,8 +324,12 @@ def metrik_codex(pfad, voll=False):
             ges = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
             letzt = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
             # Codex zaehlt den Cache in input_tokens mit
-            m["tok"] = {"ein": _int(ges.get("input_tokens")), "cache": _int(ges.get("cached_input_tokens")),
-                        "aus": _int(ges.get("output_tokens"))}
+            jetzt = {"ein": _int(ges.get("input_tokens")), "cache": _int(ges.get("cached_input_tokens")),
+                     "aus": _int(ges.get("output_tokens"))}
+            if vorher and jetzt["ein"] < vorher["ein"]:
+                basis = {k: basis[k] + vorher[k] for k in basis}
+            vorher = jetzt
+            m["tok"] = {k: basis[k] + jetzt[k] for k in jetzt}
             m["ctx"] = _int(letzt.get("total_tokens")) or m["ctx"]
             m["fenster"] = _int(info.get("model_context_window")) or m["fenster"]
         elif typ == "task_started":
@@ -329,20 +349,19 @@ def metrik_agy(pfad):
     m = {"ctx": 0, "fenster": 0, "modell": "", "tok": None, "arbeit_s": None}
     ein = cache = aus = 0
     gefunden = False
-    with open(pfad, encoding="utf-8", errors="replace") as f:
-        for z in f:
-            if '"input_tokens"' not in z:
-                continue
-            try:
-                r = json.loads(z)
-            except Exception:
-                continue
-            if not isinstance(r, dict):
-                continue
-            i, c = _int(r.get("input_tokens")), _int(r.get("cache_read_tokens"))
-            ein, cache, aus = ein + i + c, cache + c, aus + _int(r.get("output_tokens"))
-            m["ctx"] = i + c
-            gefunden = True
+    for z in _zeilen(pfad):
+        if '"input_tokens"' not in z:
+            continue
+        try:
+            r = json.loads(z)
+        except Exception:
+            continue
+        if not isinstance(r, dict):
+            continue
+        i, c, o = _int(r.get("input_tokens")), _int(r.get("cache_read_tokens")), _int(r.get("output_tokens"))
+        ein, cache, aus = ein + i + c, cache + c, aus + o
+        m["ctx"] = i + c + o
+        gefunden = True
     if gefunden:
         m["tok"] = {"ein": ein, "cache": cache, "aus": aus}
     return m
@@ -352,14 +371,16 @@ METRIK_CACHE = os.path.join(os.path.dirname(CACHE), "metrik.json")
 
 
 def metriken(paare):
-    """{Datei: Metrik} fuer die Liste; Cache nach mtime/Groesse (enthaelt nur Zahlen)."""
+    """{Datei: Kontext} fuer die Liste, alle Agenten in einem Aufruf (sonst verdraengt einer
+    den anderen im Cache). Cache nach mtime/Groesse, enthaelt nur Pfad, Schluessel, Zahl."""
     try:
         with open(METRIK_CACHE) as f:
             alt = json.load(f)
-        alt = alt.get("e", {}) if alt.get("v") == 1 else {}
+        alt = alt.get("e") if isinstance(alt, dict) and alt.get("v") == 2 else {}
+        alt = alt if isinstance(alt, dict) else {}
     except Exception:
         alt = {}
-    neu, aus = {}, {}
+    neu = {}
     for agent, pfad in paare:
         if not pfad:
             continue
@@ -369,29 +390,31 @@ def metriken(paare):
             continue
         k = f"{st.st_mtime_ns}:{st.st_size}"
         e = alt.get(pfad)
-        if not e or e.get("k") != k:
+        if not isinstance(e, dict) or e.get("k") != k:
             try:
-                e = dict(metrik_codex(pfad) if agent == "codex" else metrik_agy(pfad), k=k)
+                e = {"k": k, "ctx": (metrik_codex(pfad) if agent == "codex" else metrik_agy(pfad))["ctx"]}
             except Exception:
                 continue
-        neu[pfad] = aus[pfad] = e
-    try:
-        os.makedirs(os.path.dirname(METRIK_CACHE), mode=0o700, exist_ok=True)
-        tmp = METRIK_CACHE + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump({"v": 1, "e": neu}, f)
-        os.replace(tmp, METRIK_CACHE)
-    except OSError:
-        pass
-    return aus
+        neu[pfad] = {"k": k, "ctx": _int(e.get("ctx"))}
+    if neu != alt:
+        try:
+            os.makedirs(os.path.dirname(METRIK_CACHE), mode=0o700, exist_ok=True)
+            tmp = f"{METRIK_CACHE}.{os.getpid()}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                os.fchmod(f.fileno(), 0o600)
+                json.dump({"v": 2, "e": neu}, f)
+            os.replace(tmp, METRIK_CACHE)
+        except OSError:
+            pass
+    return {pfad: e["ctx"] for pfad, e in neu.items()}
 
 
 def kzahl(n):
     """Tokenzahl kurz: 850, 182k, 1,2 M."""
     if n < 1000:
         return str(n)
-    if n < 1_000_000:
+    if n < 999_500:  # sonst "1000k"
         return f"{round(n / 1000)}k"
     return tr(f"{n / 1e6:.1f} M".replace(".", ","), f"{n / 1e6:.1f}M")
 
@@ -915,8 +938,8 @@ def _formatieren(zeilen_, treffer=None, mit_agent=False):
         mark = FERN if r.get("remote") else "●" if r["aktiv"] else " "
         wer = f"\x1b[2m{name(r['agent']):<8}\x1b[0m " if mit_agent else ""
         extra = f"  [{treffer[r['key']]}×]" if treffer else ""
-        if r.get("ctx"):
-            extra = f"  \x1b[2m{kzahl(r['ctx'])}\x1b[0m" + extra
+        if _int(r.get("ctx")):
+            extra = f"  \x1b[2m{kzahl(_int(r['ctx']))}\x1b[0m" + extra
         ordner = "" if r["cwd"] == haupt else f"  \x1b[2m{kurz(sauber(ordner_kurz(r['cwd'])), 30)}\x1b[0m"
         aus.append(f"{r['key']}\t{tag(r['ende'])} {mark} {wer}{kurz(sauber(r['titel']), 60)}{extra}{ordner}")
     return aus
@@ -929,14 +952,21 @@ def liste(agent="alle"):
         lauf = laufend()
         auf, fern = set(lauf), {s for s, v in lauf.items() if v["remote"]}
         r += [_claude_zeile(e, auf, fern) for e in index()]
-    for a in andere_agenten(agent):
-        items = andere(a)
-        m = metriken([(a, datei_andere(i)) for i in items]) if a in ("codex", "agy") else {}
-        for i in items:
-            z = _andere_zeile(i)
-            z["ctx"] = (m.get(datei_andere(i)) or {}).get("ctx") if m else None
-            r.append(z)
+    andere_ = [(a, i) for a in andere_agenten(agent) for i in andere(a)]
+    r += _mit_kontext(andere_)
     return _formatieren(r, mit_agent=(agent == "alle"))
+
+
+def _mit_kontext(paare):
+    """Zeilen fuer Sitzungen ausser Claude, Codex/Agy mit Kontext (ein Cache-Aufruf)."""
+    dateien = {id(i): datei_andere(i) for a, i in paare if a in ("codex", "agy")}
+    m = metriken([(a, dateien[id(i)]) for a, i in paare if id(i) in dateien])
+    zeilen = []
+    for a, i in paare:
+        z = _andere_zeile(i)
+        z["ctx"] = m.get(dateien.get(id(i)))
+        zeilen.append(z)
+    return zeilen
 
 
 def rahmen(agent):
@@ -1002,17 +1032,19 @@ def inhaltssuche(q, agent="alle"):
         return [], {}
     quellen = []  # (Zeile, Agent, Datei)
     if agent in ("alle", "claude"):
-        auf = offene()
-        quellen += [(_claude_zeile(e, auf), "claude", e["pfad"]) for e in index() if e.get("pfad")]
+        lauf = laufend()
+        fern = {s for s, v in lauf.items() if v["remote"]}
+        quellen += [(_claude_zeile(e, set(lauf), fern), "claude", e["pfad"]) for e in index() if e.get("pfad")]
     direkt = []  # ohne Datei-Vorfilter (Datenbank)
     for a in andere_agenten(agent):
         if a == "opencode":
             direkt = andere(a)
         elif a in ("codex", "agy"):
-            for i in andere(a):
+            its = andere(a)
+            for z, i in zip(_mit_kontext([(a, i) for i in its]), its):
                 d = datei_andere(i)
                 if d:
-                    quellen.append((_andere_zeile(i), a, d))
+                    quellen.append((z, a, d))
     # Die Verlaufsdateien sind JSON: " und \ stehen dort maskiert, Umlaute
     # mal im Klartext, mal als \uXXXX. Vorfilter daher mit beiden maskierten
     # Formen, gezaehlt wird im entpackten Text.
@@ -1116,7 +1148,7 @@ def _vorschau_drucken(titel_, agent, cwd, e, offen, info=None):
         k = kzahl(info["ctx"])
         if info.get("fenster"):
             k += tr(f" von {kzahl(info['fenster'])} ({round(100 * info['ctx'] / info['fenster'])} %)",
-                    f" of {kzahl(info['fenster'])} ({round(100 * info['ctx'] / info['fenster'])} %)")
+                    f" of {kzahl(info['fenster'])} ({round(100 * info['ctx'] / info['fenster'])}%)")
         mod = f"   {D}{tr('Modell', 'Model')}:{N} {sauber(info['modell'])}" if info.get("modell") else ""
         print(f"{D}{tr('Kontext', 'Context')}:{N} {k}{mod}")
     tok = info.get("tok")
@@ -1190,8 +1222,12 @@ def vorschau(sid):
     if not pfad:
         print(tr("Sitzung nicht gefunden.", "Session not found."))
         return
-    e = auswerten(pfad)
-    e["antwort"] = letzte_antwort(pfad)
+    try:
+        e = auswerten(pfad)
+        e["antwort"] = letzte_antwort(pfad)
+    except Exception:
+        print(tr("Verlauf nicht lesbar.", "Transcript not readable."))
+        return
     lauf = laufend().get(sid)
     info = {"ctx": e["ctx"], "modell": e["modell"], "tok": e["tok"], "arbeit_s": e["arbeit_s"],
             "status": (lauf or {}).get("status"), "remote": bool(lauf and lauf["remote"])}
