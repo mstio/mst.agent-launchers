@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mst.agent-launchers",
   "name": "AI Agent Launchers",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "author": "mstio",
   "license": "MIT",
   "description": "Launch and resume Claude Code, Codex and Agy from one bar icon: running and recent sessions per agent, a window with all sessions, also opencode and more (agent choice, search, preview, fork) and read-only quota tooltips. English or German.",

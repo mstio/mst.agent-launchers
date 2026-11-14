@@ -528,5 +528,87 @@ class WeitereAgentenTest(unittest.TestCase):
         self.assertEqual(len(self.m.liste("alle")), 4)
 
 
+class KennzahlenTest(unittest.TestCase):
+    """Tokens, Kontext, Agentenzeit und Remote-Markierung (erfundene Datensaetze)."""
+
+    def setUp(self):
+        basis = os.environ.get("XDG_RUNTIME_DIR")
+        self.tmp = tempfile.TemporaryDirectory(dir=basis if basis and os.path.isdir(basis)
+                                               else Path(__file__).resolve().parent)
+        self.home = self.tmp.name
+        self.m = lade(self.home)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_claude_tokens_je_nachricht_einmal_kontext_der_letzten_anfrage(self):
+        a = self.home
+        u1 = {"input_tokens": 10, "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 5, "output_tokens": 7}
+        u2 = {"input_tokens": 20, "cache_read_input_tokens": 2000, "cache_creation_input_tokens": 0, "output_tokens": 30}
+        sitzung(self.home, ID_A, a, [
+            user("Frage eins", a),
+            # zwei Zeilen derselben Nachricht (je Inhaltsblock) -> nur einmal zaehlen
+            zeile(type="assistant", cwd=a, timestamp="2026-11-01T10:01:00Z",
+                  message={"id": "m1", "model": "claude-x", "usage": u1, "content": [{"type": "thinking"}]}),
+            zeile(type="assistant", cwd=a, timestamp="2026-11-01T10:01:01Z",
+                  message={"id": "m1", "model": "claude-x", "usage": u1, "content": [{"type": "text", "text": "a"}]}),
+            zeile(type="system", subtype="turn_duration", durationMs=90_000, isSidechain=False),
+            zeile(type="assistant", cwd=a, timestamp="2026-11-01T10:02:00Z", isSidechain=True,
+                  message={"id": "s1", "model": "claude-y", "usage": u2, "content": []}),
+            zeile(type="system", subtype="turn_duration", durationMs=True),  # Unsinn ignorieren
+        ])
+        e = self.m.auswerten(next(Path(self.home, ".claude", "projects").glob("*/*.jsonl")))
+        self.assertEqual(e["tok"], {"ein": 1015 + 2020, "cache": 3000, "aus": 37})
+        self.assertEqual(e["ctx"], 1015)  # Nebenkette (Unteragent) zaehlt nicht zum Kontext
+        self.assertEqual(e["modell"], "claude-x")
+        self.assertEqual(e["arbeit_s"], 90)
+
+    def _codex(self, zeilen):
+        d = Path(self.home, "rollout.jsonl")
+        d.write_text("".join(zeilen))
+        return str(d)
+
+    def test_codex_kontext_fenster_tokens_und_arbeitszeit(self):
+        tc = lambda total, ctx: zeile(timestamp="2026-11-01T10:00:05Z", type="event_msg", payload={
+            "type": "token_count", "info": {"total_token_usage": {"input_tokens": total, "cached_input_tokens": total // 2,
+                                                                   "output_tokens": 9},
+                                            "last_token_usage": {"total_tokens": ctx}, "model_context_window": 1000}})
+        d = self._codex([
+            zeile(timestamp="2026-11-01T10:00:00Z", type="turn_context", payload={"model": "gpt-z"}),
+            zeile(timestamp="2026-11-01T10:00:00Z", type="event_msg", payload={"type": "task_started"}),
+            tc(100, 50),
+            zeile(timestamp="2026-11-01T10:01:00Z", type="event_msg", payload={"type": "task_complete"}),
+            zeile(timestamp="2026-11-01T10:05:00Z", type="event_msg", payload={"type": "task_started"}),
+            tc(400, 250),
+            zeile(timestamp="2026-11-01T10:05:30Z", type="event_msg", payload={"type": "turn_aborted"}),
+            zeile(type="event_msg", payload={"type": "token_count", "info": None}),  # ohne Angaben
+        ])
+        m = self.m.metrik_codex(d, voll=True)
+        self.assertEqual((m["ctx"], m["fenster"], m["modell"], m["arbeit_s"]), (250, 1000, "gpt-z", 90))
+        self.assertEqual(m["tok"], {"ein": 400, "cache": 200, "aus": 9})
+        self.assertIsNone(self.m.metrik_codex(d)["arbeit_s"])  # Liste: nur Dateiende, keine Zeit
+
+    def test_agy_tokens_und_kontext(self):
+        d = self._codex([zeile(type="PLANNER_RESPONSE", input_tokens=100, cache_read_tokens=0, output_tokens=5),
+                         zeile(type="PLANNER_RESPONSE", input_tokens=10, cache_read_tokens=200, output_tokens=6)])
+        m = self.m.metrik_agy(d)
+        self.assertEqual((m["ctx"], m["tok"]), (210, {"ein": 310, "cache": 200, "aus": 11}))
+
+    def test_remote_markierung_und_kontext_in_der_zeile(self):
+        z = self.m._formatieren([
+            {"key": "a", "agent": "claude", "ende": 2.0, "titel": "Fern", "cwd": "/x", "aktiv": True,
+             "remote": True, "ctx": 182_000},
+            {"key": "b", "agent": "claude", "ende": 1.0, "titel": "Lokal", "cwd": "/x", "aktiv": True, "ctx": 0}])
+        self.assertIn(" \U000f0121 Fern  \x1b[2m182k", z[0])
+        self.assertIn(" ● Lokal", z[1])
+        self.assertNotIn("\x1b[2m0", z[1])
+
+    def test_kurzformen(self):
+        with mock.patch.dict(os.environ, {"AGENT_LAUNCHERS_LANG": "de"}):
+            self.assertEqual([self.m.kzahl(n) for n in (850, 182_400, 4_120_000)], ["850", "182k", "4,1 M"])
+            self.assertEqual([self.m.dauer(s) for s in (30, 600, 7500, 90000)],
+                             ["< 1 min", "10 min", "2 h 05 min", "1 T 1 h"])
+
+
 if __name__ == "__main__":
     unittest.main()

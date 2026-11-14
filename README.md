@@ -98,7 +98,8 @@ Experimental means: store locations and formats follow [omarchy-session-browser]
 | Ctrl+R | reload the current agent view (clears the filter and leaves the content search) |
 | Esc | close |
 
-- Preview: folder, period, number of prompts, first and last prompt, last answer (Codex: its final answer, otherwise the last interim note).
+- Row: `●` = open now, `󰄡` (Nerd Font `md-cellphone_link`) = open and reachable via Claude Remote Control; the dim number after the title is the context of the last request in tokens (Claude, Codex, Agy).
+- Preview: folder, period and how long ago, duration and how long the agent actually worked (Claude: `turn_duration` records, Codex: from task start to completion), context (Codex also as share of the model's window), model, tokens in and out (input with the share served from cache), for open Claude sessions whether the agent is working or waiting for input; then number of prompts, first and last prompt, last answer (Codex: its final answer, otherwise the last interim note). No costs: with a subscription they would only be a notional API price.
 - The window uses the app id `TUI.float`, which Omarchy already floats and centers; no window rule needed.
 - Own key binding (optional), e.g. in `~/.config/hypr/bindings.lua`:
 
@@ -155,8 +156,8 @@ The plugin only **reads**, and only these files:
 
 | What | Files | When |
 |---|---|---|
-| Claude sessions | `~/.claude/projects/*/*.jsonl`, `~/.claude/sessions/*.json` (or below `$CLAUDE_CONFIG_DIR`) | menu, window |
-| Codex sessions | `~/.codex/session_index.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl` (first line for the lists, the whole file for preview and search) | menu, window |
+| Claude sessions | `~/.claude/projects/*/*.jsonl`, `~/.claude/sessions/*.json` (or below `$CLAUDE_CONFIG_DIR`; from the latter only state, status and whether a Remote Control id is set, never its value) | menu, window |
+| Codex sessions | `~/.codex/session_index.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl` (first line for the lists, the window also the last 256 KB for context and tokens, the whole file for preview and search) | menu, window |
 | Agy sessions | below `~/.gemini/antigravity-cli/`: `cache/conversation_metadata.json`, `cache/last_conversations.json`; for preview and search `brain/<id>/.system_generated/logs/transcript_full.jsonl` (or `transcript.jsonl`) | menu, window |
 | opencode sessions | `~/.local/share/opencode/opencode.db` (sessions without archived and sub-agent ones), opened read-only (`mode=ro`, `query_only`): the content is never changed, but like any reader SQLite may create or refresh its helper files `opencode.db-shm` / `-wal` | window |
 | Experimental agents | `~/.copilot/session-state/*/events.jsonl` and `history-session-state/*.json`, `~/.pi/agent/sessions/**/*.jsonl`, `~/.gemini/tmp/*/chats/session-*.json(l)` and `.project_root`, `~/.grok/sessions/*/*/summary.json` and `subagents/*/meta.json` (or below `$GROK_HOME`); event logs only their first lines, JSON files up to 2 MB (Gemini's older single-file form up to 20 MB) | window |
@@ -164,7 +165,7 @@ The plugin only **reads**, and only these files:
 | Quota | the usage files above; JSON files named after Agy (`*agy*`, `*antigravity*`, `*gemini*`, never `*token*`, `*auth*`, `*oauth*`, `*credential*`) below `~/.local/state/omarchy` and `~/.cache/omarchy` | tooltip, every 60 s |
 
 - **No network, no service.** The session lists are read only when you open the menu (~0.5 s) or the window. Never the `.key` files next to the session files.
-- **Index cache** `~/.cache/agent-sessions/index.json` for Claude in the window, mode 0600 because it contains prompt excerpts; rebuilt per file by mtime and size, safe to delete. Codex and Agy are read directly, without a cache.
+- **Index cache** `~/.cache/agent-sessions/index.json` for Claude in the window, mode 0600 because it contains prompt excerpts; rebuilt per file by mtime and size, safe to delete. Codex and Agy texts are read directly, without a cache; their token counts are cached in `~/.cache/agent-sessions/metrik.json` (0600, numbers only).
 - **Untrusted text:** titles and conversation texts are model output; control, C1, bidi and zero-width characters are stripped before display, and the menu renders them as plain text.
 - **Resuming** only uses a checked session id (letters, digits, dashes) in an existing folder: the window starts it as an argument list without a shell and only for folders below `$HOME`; the menu runs a shell line with the folder quoted (`shlex.quote`).
 - No automatic agent switching, no change of the Omarchy default agent, no `--dangerously-skip-permissions`.

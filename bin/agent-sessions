@@ -55,7 +55,7 @@ UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 CODEX = os.path.join(HOME, ".codex", "sessions")
 AGY_BRAIN = os.path.join(HOME, ".gemini", "antigravity-cli", "brain")
 SELF = os.path.abspath(__file__)
-VERSION = 2
+VERSION = 3  # 3: Tokens, Kontext, Agentenzeit
 WOCHENTAG = {"de": ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"],
              "en": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]}
 
@@ -90,7 +90,10 @@ LAUFZEIT_VARS = {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CODE_CHILD
 CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u2060\ufeff\u202a-\u202e\u2066-\u2069]")
 REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 TYPEN = ('"type":"user"', '"type":"assistant"', '"type":"ai-title"',
-         '"type":"custom-title"', '"type":"last-prompt"')
+         '"type":"custom-title"', '"type":"last-prompt"', '"subtype":"turn_duration"')
+# Symbol fuer per Remote Control erreichbare Claude-Sitzungen: Nerd-Font-Glyphe
+# md-cellphone_link (U+F0121), wie Omarchy Material-Design-Glyphen nutzt.
+FERN = "\U000f0121"
 # Codex: neue Rollouts (item_completed) und aeltere (event_msg). Agy: Eingabe
 # steht in <USER_REQUEST>, daneben Metadaten und Einstellungen.
 TEILE_CLAUDE = ('"type":"user"', '"type":"assistant"')
@@ -199,10 +202,17 @@ def _str(v):
     return v if isinstance(v, str) else ""
 
 
+def _int(v):
+    """Nichtnegative Zahl aus undokumentierten Feldern, sonst 0."""
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else 0
+
+
 def auswerten(pfad):
     d = {"titel": "", "eigener_titel": "", "cwd": "", "erste": "", "letzte": "",
-         "fragen": 0, "beginn": None, "ende": None}
+         "fragen": 0, "beginn": None, "ende": None, "ctx": 0, "modell": "", "arbeit_s": 0}
     letzte_eigen = ""
+    nutzung = {}  # Nachrichten-ID -> Tokens; Claude schreibt je Inhaltsblock eine Zeile
+    arbeit_ms = 0
     with open(pfad, encoding="utf-8", errors="replace") as f:
         for zeile in f:
             if not any(t in zeile for t in TYPEN):
@@ -220,7 +230,20 @@ def auswerten(pfad):
                 d["eigener_titel"] = _str(r.get("customTitle")) or d["eigener_titel"]
             elif typ == "last-prompt":
                 d["letzte"] = _str(r.get("lastPrompt"))[:2000] or d["letzte"]
+            elif typ == "system" and r.get("subtype") == "turn_duration" and not r.get("isSidechain"):
+                arbeit_ms += _int(r.get("durationMs"))
             elif typ in ("user", "assistant"):
+                m = r.get("message")
+                if typ == "assistant" and isinstance(m, dict) and isinstance(m.get("usage"), dict):
+                    u = m["usage"]
+                    werte = (_int(u.get("input_tokens")), _int(u.get("cache_read_input_tokens")),
+                             _int(u.get("cache_creation_input_tokens")), _int(u.get("output_tokens")))
+                    nutzung[_str(m.get("id")) or _str(r.get("uuid")) or str(len(nutzung))] = werte
+                    if not r.get("isSidechain"):
+                        d["ctx"] = werte[0] + werte[1] + werte[2]  # Kontext der letzten Anfrage
+                        mod = _str(m.get("model"))
+                        if mod and not mod.startswith("<"):  # "<synthetic>" = keine echte Antwort
+                            d["modell"] = mod[:60]
                 if r.get("isSidechain"):
                     continue
                 ts = zeitstempel(r.get("timestamp", ""))
@@ -237,7 +260,158 @@ def auswerten(pfad):
                         letzte_eigen = t[:2000]
     if letzte_eigen:
         d["letzte"] = letzte_eigen
+    w = list(nutzung.values())
+    d["tok"] = {"ein": sum(a + b + c for a, b, c, _ in w), "cache": sum(b for _, b, _, _ in w),
+                "aus": sum(x[3] for x in w)}
+    d["arbeit_s"] = arbeit_ms // 1000
     return d
+
+
+def _ende_lesen(pfad, n):
+    """Letzte n Bytes einer Datei als Zeilen (erste, evtl. angeschnittene, verworfen)."""
+    with open(pfad, "rb") as f:
+        f.seek(0, 2)
+        groesse = f.tell()
+        f.seek(max(0, groesse - n))
+        z = f.read().decode("utf-8", "replace").splitlines()
+    return z if groesse <= n else z[1:]
+
+
+def metrik_codex(pfad, voll=False):
+    """Tokens, Kontext, Modell (und mit voll Agentenzeit) einer Codex-Sitzung.
+    Ohne voll nur das Dateiende: das letzte token_count genuegt fuer Kontext und Summe."""
+    m = {"ctx": 0, "fenster": 0, "modell": "", "tok": None, "arbeit_s": None}
+    zeilen = None if voll else _ende_lesen(pfad, 262_144)
+    if zeilen is not None and not any('"token_count"' in z for z in zeilen):
+        zeilen = None  # nichts im Ende: ganze Datei
+    if zeilen is None:
+        with open(pfad, encoding="utf-8", errors="replace") as f:
+            zeilen = f.read().splitlines()
+        voll = True
+    start, arbeit = None, 0.0
+    for z in zeilen:
+        if not any(k in z for k in ('"token_count"', '"turn_context"', '"task_started"',
+                                     '"task_complete"', '"turn_aborted"')):
+            continue
+        try:
+            r = json.loads(z)
+        except Exception:
+            continue
+        p = r.get("payload") if isinstance(r, dict) else None
+        if not isinstance(p, dict):
+            continue
+        typ = p.get("type")
+        if r.get("type") == "turn_context":
+            m["modell"] = _str(p.get("model"))[:60] or m["modell"]
+        elif typ == "token_count" and isinstance(p.get("info"), dict):
+            info = p["info"]
+            ges = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
+            letzt = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
+            # Codex zaehlt den Cache in input_tokens mit
+            m["tok"] = {"ein": _int(ges.get("input_tokens")), "cache": _int(ges.get("cached_input_tokens")),
+                        "aus": _int(ges.get("output_tokens"))}
+            m["ctx"] = _int(letzt.get("total_tokens")) or m["ctx"]
+            m["fenster"] = _int(info.get("model_context_window")) or m["fenster"]
+        elif typ == "task_started":
+            start = zeitstempel(_str(r.get("timestamp")))
+        elif typ in ("task_complete", "turn_aborted") and start:
+            ende = zeitstempel(_str(r.get("timestamp")))
+            if ende and ende >= start:
+                arbeit += ende - start
+            start = None
+    if voll:
+        m["arbeit_s"] = int(arbeit)
+    return m
+
+
+def metrik_agy(pfad):
+    """Tokens und Kontext einer Agy-Sitzung (Schritte mit input_tokens; Cache getrennt gezaehlt)."""
+    m = {"ctx": 0, "fenster": 0, "modell": "", "tok": None, "arbeit_s": None}
+    ein = cache = aus = 0
+    gefunden = False
+    with open(pfad, encoding="utf-8", errors="replace") as f:
+        for z in f:
+            if '"input_tokens"' not in z:
+                continue
+            try:
+                r = json.loads(z)
+            except Exception:
+                continue
+            if not isinstance(r, dict):
+                continue
+            i, c = _int(r.get("input_tokens")), _int(r.get("cache_read_tokens"))
+            ein, cache, aus = ein + i + c, cache + c, aus + _int(r.get("output_tokens"))
+            m["ctx"] = i + c
+            gefunden = True
+    if gefunden:
+        m["tok"] = {"ein": ein, "cache": cache, "aus": aus}
+    return m
+
+
+METRIK_CACHE = os.path.join(os.path.dirname(CACHE), "metrik.json")
+
+
+def metriken(paare):
+    """{Datei: Metrik} fuer die Liste; Cache nach mtime/Groesse (enthaelt nur Zahlen)."""
+    try:
+        with open(METRIK_CACHE) as f:
+            alt = json.load(f)
+        alt = alt.get("e", {}) if alt.get("v") == 1 else {}
+    except Exception:
+        alt = {}
+    neu, aus = {}, {}
+    for agent, pfad in paare:
+        if not pfad:
+            continue
+        try:
+            st = os.stat(pfad)
+        except OSError:
+            continue
+        k = f"{st.st_mtime_ns}:{st.st_size}"
+        e = alt.get(pfad)
+        if not e or e.get("k") != k:
+            try:
+                e = dict(metrik_codex(pfad) if agent == "codex" else metrik_agy(pfad), k=k)
+            except Exception:
+                continue
+        neu[pfad] = aus[pfad] = e
+    try:
+        os.makedirs(os.path.dirname(METRIK_CACHE), mode=0o700, exist_ok=True)
+        tmp = METRIK_CACHE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"v": 1, "e": neu}, f)
+        os.replace(tmp, METRIK_CACHE)
+    except OSError:
+        pass
+    return aus
+
+
+def kzahl(n):
+    """Tokenzahl kurz: 850, 182k, 1,2 M."""
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{round(n / 1000)}k"
+    return tr(f"{n / 1e6:.1f} M".replace(".", ","), f"{n / 1e6:.1f}M")
+
+
+def dauer(s):
+    s = int(s)
+    if s < 60:
+        return tr("< 1 min", "< 1 min")
+    if s < 3600:
+        return f"{s // 60} min"
+    if s < 86400:
+        return f"{s // 3600} h {s % 3600 // 60:02d} min"
+    return tr(f"{s // 86400} T {s % 86400 // 3600} h", f"{s // 86400} d {s % 86400 // 3600} h")
+
+
+def vor(ts):
+    s = max(0, time.time() - ts)
+    if s < 60:
+        return tr("gerade eben", "just now")
+    return tr(f"vor {dauer(s)}", f"{dauer(s)} ago")
 
 
 def ordner_zulaessig(cwd):
@@ -381,6 +555,12 @@ def index():
 
 def offene():
     """Sitzungs-IDs, die gerade in einem laufenden Claude-Prozess offen sind -> PID."""
+    return {s: v["pid"] for s, v in laufend().items()}
+
+
+def laufend():
+    """Offene Claude-Sitzungen -> PID, Zustand (busy/idle) und ob Remote Control
+    verbunden ist (bridgeSessionId in sessions/<pid>.json; .key-Dateien nie lesen)."""
     r = {}
     for f in glob.glob(os.path.join(REG, "*.json")):
         try:
@@ -396,7 +576,8 @@ def offene():
                 with open(f"/proc/{pid}/cmdline", "rb") as h:
                     if b"claude" not in h.read():
                         continue  # PID wiederverwendet
-            r[j["sessionId"]] = pid
+            r[j["sessionId"]] = {"pid": pid, "status": _str(j.get("status")),
+                                 "remote": bool(j.get("bridgeSessionId"))}
         except Exception:
             continue
     return r
@@ -709,9 +890,9 @@ def opencode_texte(sids, filt=None):
     return aus
 
 
-def _claude_zeile(e, auf):
+def _claude_zeile(e, auf, fern=()):
     return {"key": e["id"], "agent": "claude", "ende": e["ende"], "titel": titel(e),
-            "cwd": e["cwd"], "aktiv": e["id"] in auf}
+            "cwd": e["cwd"], "aktiv": e["id"] in auf, "remote": e["id"] in fern, "ctx": e.get("ctx")}
 
 
 def _andere_zeile(i):
@@ -731,9 +912,11 @@ def _formatieren(zeilen_, treffer=None, mit_agent=False):
         haupt = max(zaehler, key=zaehler.get)
     aus = []
     for r in zeilen_:
-        mark = "●" if r["aktiv"] else " "
+        mark = FERN if r.get("remote") else "●" if r["aktiv"] else " "
         wer = f"\x1b[2m{name(r['agent']):<8}\x1b[0m " if mit_agent else ""
         extra = f"  [{treffer[r['key']]}×]" if treffer else ""
+        if r.get("ctx"):
+            extra = f"  \x1b[2m{kzahl(r['ctx'])}\x1b[0m" + extra
         ordner = "" if r["cwd"] == haupt else f"  \x1b[2m{kurz(sauber(ordner_kurz(r['cwd'])), 30)}\x1b[0m"
         aus.append(f"{r['key']}\t{tag(r['ende'])} {mark} {wer}{kurz(sauber(r['titel']), 60)}{extra}{ordner}")
     return aus
@@ -743,10 +926,16 @@ def liste(agent="alle"):
     """Zeilen fuer die gewaehlte Agenten-Ansicht, neueste oben."""
     r = []
     if agent in ("alle", "claude"):
-        auf = offene()
-        r += [_claude_zeile(e, auf) for e in index()]
+        lauf = laufend()
+        auf, fern = set(lauf), {s for s, v in lauf.items() if v["remote"]}
+        r += [_claude_zeile(e, auf, fern) for e in index()]
     for a in andere_agenten(agent):
-        r += [_andere_zeile(i) for i in andere(a)]
+        items = andere(a)
+        m = metriken([(a, datei_andere(i)) for i in items]) if a in ("codex", "agy") else {}
+        for i in items:
+            z = _andere_zeile(i)
+            z["ctx"] = (m.get(datei_andere(i)) or {}).get("ctx") if m else None
+            r.append(z)
     return _formatieren(r, mit_agent=(agent == "alle"))
 
 
@@ -900,7 +1089,7 @@ def ZEITFORMAT():
     return tr("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M")
 
 
-def _vorschau_drucken(titel_, agent, cwd, e, offen):
+def _vorschau_drucken(titel_, agent, cwd, e, offen, info=None):
     B, D, N = "\x1b[1m", "\x1b[2m", "\x1b[0m"
 
     def absatz(s, n):
@@ -913,9 +1102,37 @@ def _vorschau_drucken(titel_, agent, cwd, e, offen):
     print(f"{wer}{D}{tr('Ordner', 'Folder')}:{N} {sauber(ordner_kurz(cwd))}{zahl}")
     von = datetime.fromtimestamp(e["beginn"]).strftime(ZEITFORMAT()) if e["beginn"] else "?"
     bis = datetime.fromtimestamp(e["ende"]).strftime(ZEITFORMAT()) if e["ende"] else "?"
-    print(f"{D}{tr('Zeitraum', 'Period')}:{N} {von} - {bis}")
+    rel = f"  {D}({vor(e['ende'])}){N}" if e["ende"] else ""
+    print(f"{D}{tr('Zeitraum', 'Period')}:{N} {von} - {bis}{rel}")
+    info = info or {}
+    teile = []
+    if e["beginn"] and e["ende"] and e["ende"] >= e["beginn"]:
+        teile.append(f"{D}{tr('Dauer', 'Duration')}:{N} {dauer(e['ende'] - e['beginn'])}")
+    if info.get("arbeit_s"):
+        teile.append(f"{D}{tr('Agent arbeitete', 'Agent worked')}:{N} {dauer(info['arbeit_s'])}")
+    if teile:
+        print("   ".join(teile))
+    if info.get("ctx"):
+        k = kzahl(info["ctx"])
+        if info.get("fenster"):
+            k += tr(f" von {kzahl(info['fenster'])} ({round(100 * info['ctx'] / info['fenster'])} %)",
+                    f" of {kzahl(info['fenster'])} ({round(100 * info['ctx'] / info['fenster'])} %)")
+        mod = f"   {D}{tr('Modell', 'Model')}:{N} {sauber(info['modell'])}" if info.get("modell") else ""
+        print(f"{D}{tr('Kontext', 'Context')}:{N} {k}{mod}")
+    tok = info.get("tok")
+    if tok and (tok["ein"] or tok["aus"]):
+        cache = tr(f" (davon {kzahl(tok['cache'])} aus dem Cache)", f" ({kzahl(tok['cache'])} from cache)") \
+            if tok["cache"] else ""
+        print(f"{D}Tokens:{N} {tr('Eingabe', 'input')} {kzahl(tok['ein'])}{cache} · "
+              f"{tr('Ausgabe', 'output')} {kzahl(tok['aus'])}")
     if offen:
-        print("\x1b[33m● " + tr("gerade in einem Fenster offen", "open in a window right now") + "\x1b[0m")
+        zustand = {"busy": tr("arbeitet", "working"), "idle": tr("wartet auf Eingabe", "waiting for input")}
+        z = zustand.get(info.get("status"), "")
+        if info.get("remote"):
+            text = FERN + " " + tr("gerade offen, per Remote Control erreichbar", "open now, reachable via Remote Control")
+        else:
+            text = "● " + tr("gerade in einem Fenster offen", "open in a window right now")
+        print("\x1b[33m" + text + (f" · {z}" if z else "") + "\x1b[0m")
     if e["erste"]:
         print()
         print(B + tr("Erste Eingabe", "First prompt") + N)
@@ -946,8 +1163,15 @@ def vorschau_andere(schluessel):
         e["fragen"] = None  # ohne Verlauf keine Zahl anzeigen
     if not e["ende"]:
         e["ende"] = float(i.get("updated") or 0) or None
+    info = None
+    d = datei_andere(i) if i["agent"] in ("codex", "agy") else None
+    if d:
+        try:
+            info = metrik_codex(d, voll=True) if i["agent"] == "codex" else metrik_agy(d)
+        except Exception:
+            info = None
     _vorschau_drucken(str(i.get("title") or tr("(ohne Titel)", "(untitled)")), i["agent"],
-                      str(i["path"]), e, bool(i.get("active")))
+                      str(i["path"]), e, bool(i.get("active")), info)
     if i["agent"] in WEITERE and not WEITERE[i["agent"]][2]:
         print()
         print("\x1b[2m" + tr(f"{name(i['agent'])} ist experimentell: Liste und Fortsetzen, "
@@ -968,7 +1192,10 @@ def vorschau(sid):
         return
     e = auswerten(pfad)
     e["antwort"] = letzte_antwort(pfad)
-    _vorschau_drucken(titel(e), "claude", e["cwd"], e, sid in offene())
+    lauf = laufend().get(sid)
+    info = {"ctx": e["ctx"], "modell": e["modell"], "tok": e["tok"], "arbeit_s": e["arbeit_s"],
+            "status": (lauf or {}).get("status"), "remote": bool(lauf and lauf["remote"])}
+    _vorschau_drucken(titel(e), "claude", e["cwd"], e, lauf is not None, info)
 
 
 def melden(text, kritisch=False):
@@ -1089,9 +1316,9 @@ def oberflaeche():
         pass
     me = SELF
     kopf = tr("Tab/Shift+Tab Agent · Enter fortsetzen · Strg+F Abzweig (Claude) · Esc schließen\n"
-              "Strg+S im Gesprächsinhalt suchen · Strg+R neu laden · ● = gerade offen",
+              f"Strg+S im Gesprächsinhalt suchen · Strg+R neu laden · ● offen · {FERN} Remote · 182k = Kontext",
               "Tab/Shift+Tab agent · Enter resume · Ctrl+F fork (Claude) · Esc close\n"
-              "Ctrl+S search conversation content · Ctrl+R reload · ● = open now")
+              f"Ctrl+S search content · Ctrl+R reload · ● open · {FERN} remote · 182k = context")
     args = [
         "fzf", "--ansi", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--tiebreak=index",
         "--layout=reverse", "--info=inline-right", "--header", kopf, "--header-first",
