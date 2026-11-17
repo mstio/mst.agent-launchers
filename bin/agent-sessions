@@ -646,13 +646,34 @@ def andere(agent):
         return []
     try:
         if agent == "codex":
-            items = STATUS.codex_sessions(STATUS.window_pids(), 0, limit=None)
+            items = _codex_einmal(STATUS.codex_sessions(STATUS.window_pids(), 0, limit=None))
         else:
             items = STATUS.agy_sessions(0)
     except Exception:
         return []
     return [i for i in items if isinstance(i, dict) and STATUS.SAFE_ID.fullmatch(str(i.get("id", "")))
             and ordner_zulaessig(str(i.get("path", "")))]
+
+
+def _codex_einmal(items):
+    """A shared transcript is one conversation, with several possible logins."""
+    groups = {}
+    for item in items:
+        key = os.path.realpath(item["file"])
+        choice = {"id": item["account"], "label": item["label"], "primary": item.get("primary", False)}
+        if key not in groups:
+            groups[key] = dict(item, accounts=[choice])
+            continue
+        group = groups[key]
+        if choice["id"] not in {c["id"] for c in group["accounts"]}:
+            group["accounts"].append(choice)
+        group["label"] = "Codex"
+        # Some account indices only have the ID, another has the actual title.
+        if group["title"] in (group["id"], group["id"][:8]) and item["title"] not in (item["id"], item["id"][:8]):
+            group["title"] = item["title"]
+        if item.get("active"):
+            group.update(active=True, focusPid=item.get("focusPid") or group.get("focusPid", 0))
+    return list(groups.values())
 
 
 def andere_agenten(agent):
@@ -919,9 +940,16 @@ def _claude_zeile(e, auf, fern=()):
 
 
 def _andere_zeile(i):
-    return {"key": f"{i['agent']}:{i['id']}", "agent": i["agent"], "ende": float(i.get("updated") or 0),
+    return {"key": _andere_key(i), "agent": i["agent"], "label": i.get("label"),
+            "account": i.get("account"), "ende": float(i.get("updated") or 0),
             "titel": sauber(str(i.get("title") or "")) or tr("(ohne Titel)", "(untitled)"), "cwd": str(i["path"]),
             "aktiv": bool(i.get("active"))}
+
+
+def _andere_key(i):
+    account = i.get("account", "main")
+    primary = i.get("primary", account == "main")
+    return f"codex:{account}:{i['id']}" if i["agent"] == "codex" and not primary else f"{i['agent']}:{i['id']}"
 
 
 def _formatieren(zeilen_, treffer=None, mit_agent=False):
@@ -937,6 +965,8 @@ def _formatieren(zeilen_, treffer=None, mit_agent=False):
     for r in zeilen_:
         mark = FERN if r.get("remote") else "●" if r["aktiv"] else " "
         wer = f"\x1b[2m{name(r['agent']):<8}\x1b[0m " if mit_agent else ""
+        if r.get("agent") == "codex" and r.get("label"):
+            wer = f"\x1b[2m{sauber(r['label'])}\x1b[0m "
         extra = f"  [{treffer[r['key']]}×]" if treffer else ""
         if _int(r.get("ctx")):
             extra = f"  \x1b[2m{kzahl(_int(r['ctx']))}\x1b[0m" + extra
@@ -991,7 +1021,9 @@ def datei_andere(i):
     """Verlaufsdatei einer Codex-/Agy-Sitzung oder None (Agy: nicht jede hat eine)."""
     if i.get("agent") == "codex":
         f = str(i.get("file") or "")
-        return f if f.startswith(CODEX + "/") and f.endswith(".jsonl") and os.path.isfile(f) else None
+        profile = next((p for p in STATUS.codex_accounts() if p["id"] == i.get("account", "main")), None)
+        root = os.path.realpath(os.path.join(profile["home"], "sessions")) if profile else ""
+        return f if root and os.path.realpath(f).startswith(root + "/") and f.endswith(".jsonl") and os.path.isfile(f) else None
     d = os.path.join(AGY_BRAIN, i["id"], ".system_generated", "logs")  # id ist per SAFE_ID geprueft
     for n in ("transcript_full.jsonl", "transcript.jsonl"):  # _full ist nicht gekuerzt
         if os.path.isfile(os.path.join(d, n)):
@@ -1114,7 +1146,15 @@ def _andere_finden(schluessel):
     agent, _, sid = (schluessel or "").partition(":")
     if agent not in AGENTEN[2:]:
         return None
-    return next((i for i in andere(agent) if i["id"] == sid), None)
+    for item in andere(agent):
+        if _andere_key(item) == schluessel:
+            return item
+        # Keep explicit account keys usable, e.g. from an already open window.
+        for choice in item.get("accounts", []):
+            selected = dict(item, account=choice["id"], primary=choice["primary"], label=choice["label"], accounts=[choice])
+            if _andere_key(selected) == schluessel:
+                return selected
+    return None
 
 
 def ZEITFORMAT():
@@ -1204,6 +1244,8 @@ def vorschau_andere(schluessel):
             info = None
     _vorschau_drucken(str(i.get("title") or tr("(ohne Titel)", "(untitled)")), i["agent"],
                       str(i["path"]), e, bool(i.get("active")), info)
+    if i.get("accounts"):
+        print(tr("Fortsetzen mit: ", "Resume with: ") + " / ".join(sauber(c["label"]) for c in i["accounts"]))
     if i["agent"] in WEITERE and not WEITERE[i["agent"]][2]:
         print()
         print("\x1b[2m" + tr(f"{name(i['agent'])} ist experimentell: Liste und Fortsetzen, "
@@ -1267,7 +1309,8 @@ def fenster_zu_pid(pid):
 
 
 def starten(befehl, cwd):
-    fehlt = [p for p in (befehl[0], "setsid", "xdg-terminal-exec") if not shutil.which(p)]
+    executable = next((a for a in befehl[1:] if "=" not in a and a != "--"), "env") if befehl[0] == "env" else befehl[0]
+    fehlt = [p for p in (executable, "setsid", "xdg-terminal-exec") if not shutil.which(p)]
     if fehlt:
         melden(tr("Nicht gefunden: ", "Not found: ") + ", ".join(fehlt), True)
         return
@@ -1279,6 +1322,24 @@ def starten(befehl, cwd):
         terminal = ["uwsm-app", "--"] + terminal
     subprocess.Popen(["setsid", "-f"] + terminal + befehl, cwd=cwd, env=umg,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def codex_konto_waehlen(item):
+    choices = item.get("accounts") or [{"id": item.get("account", "main"), "label": item.get("label", "Codex")}]
+    if len(choices) == 1:
+        return choices[0]["id"]
+    if not shutil.which("fzf"):
+        melden(tr("Kontoauswahl benötigt fzf.", "Choosing an account requires fzf."), True)
+        return None
+    rows = [c["id"] + "\t" + re.sub(r"\s+", " ", sauber(c["label"])) for c in choices]
+    result = subprocess.run(["fzf", "--no-multi", "--delimiter=\t", "--with-nth=2..", "--layout=reverse",
+                             "--height=40%", "--border=rounded", "--no-sort",
+                             "--prompt", tr("Konto", "Account") + " › ",
+                             "--header", tr("Geteilter Verlauf – mit welchem Konto fortsetzen? · Esc abbrechen",
+                                            "Shared conversation – which account should resume it? · Esc cancel")],
+                            input="\n".join(rows) + "\n", stdout=subprocess.PIPE, text=True)
+    selected = result.stdout.split("\t", 1)[0].strip() if result.returncode == 0 else ""
+    return selected if selected in {c["id"] for c in choices} else None
 
 
 def oeffnen_andere(schluessel, abzweig=False):
@@ -1301,8 +1362,13 @@ def oeffnen_andere(schluessel, abzweig=False):
         return
     if i["agent"] in WEITERE:
         befehl = WEITERE[i["agent"]][1] + [i["id"]]
+    elif i["agent"] == "codex":
+        account = codex_konto_waehlen(i)
+        if account is None:
+            return
+        befehl = STATUS.codex_command(account, "resume", i["id"])
     else:
-        befehl = ["codex", "resume", i["id"]] if i["agent"] == "codex" else ["agy", "--conversation", i["id"]]
+        befehl = ["agy", "--conversation", i["id"]]
     starten(befehl, i["path"])
 
 
@@ -1360,7 +1426,6 @@ def oberflaeche():
         "--layout=reverse", "--info=inline-right", "--header", kopf, "--header-first",
         "--prompt", tr("Suche", "Search") + " › ", "--border=rounded", "--border-label", rahmen("alle"),
         "--preview", f"'{me}' --vorschau {{1}}", "--preview-window=down,50%,wrap-word,border-top",
-        "--bind", f"enter:execute-silent('{me}' --oeffnen {{1}})+abort",
         "--bind", f"ctrl-f:execute-silent('{me}' --oeffnen {{1}} --abzweig)+abort",
         "--bind", f"ctrl-s:reload('{me}' --liste --inhalt {{q}})"
                   f"+transform-prompt(printf '{tr('Im Inhalt', 'In content')}: %s › ' {{q}})+clear-query",
@@ -1368,7 +1433,9 @@ def oberflaeche():
         "--bind", f"shift-tab:transform('{me}' --wechsel -1)",
         "--bind", f"ctrl-r:transform('{me}' --wechsel 0)",
     ]
-    subprocess.run(args, input="\n".join(liste("alle")) + "\n", text=True)
+    selected = subprocess.run(args, input="\n".join(liste("alle")) + "\n", stdout=subprocess.PIPE, text=True)
+    if selected.returncode == 0 and selected.stdout:
+        oeffnen(selected.stdout.split("\t", 1)[0].strip())
 
 
 def main(a):

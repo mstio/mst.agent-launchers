@@ -6,6 +6,7 @@ One icon in the Omarchy bar for **Claude Code**, **Codex** and **Agy / Antigravi
 
 - **Launch and resume** each agent from a small context menu.
 - **Running and recent sessions** per agent, with title, state and folder.
+- **Parallel Codex accounts**: separate launch/resume entries for the accounts already registered in Omarchy, with account labels in the session window.
 - **All sessions …** opens a floating window with every session of every agent found on the machine: agent choice, filter, preview, search in the conversation content, and fork for a follow-up question (Claude).
 - **Quota at a glance** in the tooltip, read from local usage records only.
 - English or German, following your system language.
@@ -51,8 +52,8 @@ omarchy plugin remove mst.agent-launchers
 ## Quick start
 
 1. After installing, the **✦** icon appears on the right of the bar.
-2. Click it. *Claude*, *Codex* or *Agy* starts that agent in `~/Work`; *Resume … ▸* lists its running and recent sessions.
-3. Click **All sessions …**: Tab switches the agent, typing filters the titles, **Ctrl+S** searches the conversations, **Enter** resumes the selected session in its own folder.
+2. Click it. *Claude*, *Codex* (one row per registered account) or *Agy* starts that agent in `~/Work`; *Resume … ▸* lists its running and recent sessions.
+3. Click **All sessions …**: Tab switches the agent, typing filters the titles, **Ctrl+S** searches the conversations, **Enter** resumes the selected session in its own folder (for a shared Codex transcript, first choose the account).
 4. Optional: choose the language ([Settings](#settings)) or put the window on a key ([All sessions](#all-sessions)).
 
 ## The menu
@@ -65,7 +66,7 @@ omarchy plugin remove mst.agent-launchers
 
 | Row | Effect |
 |---|---|
-| Claude / Codex / Agy | start `claude`, `codex`, `agy` in `~/Work` (in your home if `~/Work` does not exist) |
+| Claude / Codex / Agy | start the chosen agent in `~/Work` (or home); Codex shows one row per registered account and pins the chosen login, with optional local workspace/launcher overrides |
 | Resume … ▸ | expand the sessions of that agent (one agent at a time) |
 | All sessions … | open the window described below |
 
@@ -107,7 +108,7 @@ Experimental means: store locations and formats follow [omarchy-session-browser]
   o.bind("SUPER + ALT + H", "Agent sessions", "omarchy-launch-tui --app-id=TUI.float ~/.config/omarchy/plugins/mst.agent-launchers/bin/agent-sessions")
   ```
 
-  Add `--lang de` or `--lang en` at the end to match a `language` setting of the widget. The script `bin/agent-sessions` can also be run directly in any terminal.
+  Add `--lang de` or `--lang en` at the end to match a `language` setting of the widget. The script `bin/agent-sessions` can also be run directly in any terminal. Close and reopen an existing session window after upgrading to 1.9.0 so its Enter action uses the account chooser.
 
 ## Settings
 
@@ -118,6 +119,29 @@ Optional, in the widget's entry in `~/.config/omarchy/shell.json`:
 ```
 
 `language`: `en`, `de`, or leave it out to follow the system language (`LC_ALL`, `LC_MESSAGES`, `LANG`; German for `de_*`, otherwise English).
+
+## Parallel Codex accounts
+
+Add and sign in to Codex accounts through Omarchy's Agents panel; this plugin reuses those logins. The plugin automatically reads Omarchy's existing Codex account registry and offers **Codex · <account name>** for every registered account. Without an Omarchy registry, an explicitly set `CODEX_HOME` remains in use. Names are taken from your registry, including a renamed primary account; no personal configuration file is required. Added or renamed accounts appear the next time you open the menu. Omarchy keeps the account folder when you rename an account, and the plugin retains that folder when launching it. Each launch pins `CODEX_HOME` and Omarchy's inherited account pin to the chosen account, including when resuming from the session window. Switching the account in Omarchy's Agents panel does not redirect these launches. Account homes and credentials stay where they are; the plugin never reads `auth.json` or copies credentials.
+
+The Codex view shows each transcript once. When Omarchy shares the `sessions` directory through a symlink, the preview lists the accounts available to resume that conversation. Press Enter and choose the account in a small selector (Esc cancels); the selected account is pinned for that launch. Separately stored transcripts remain distinct even if their session IDs match. An already running transcript is focused directly, without an account prompt or a second client. Preview and content search also read shared transcripts only once. The bar menu still offers launch/resume under each account explicitly. The tooltip labels each account's quota from Omarchy's existing local usage cache.
+
+Optional local overrides in `~/.config/agent-launchers/codex-accounts.json`, keyed by the Omarchy account ID or its retained account folder name (`main` also refers to the original primary login):
+
+```json
+{
+  "main": { "label": "Personal", "workspace": "/home/you/Work" },
+  "work": {
+    "label": "Work",
+    "workspace": "/home/you/Projects/Work",
+    "launcher": "/home/you/.local/bin/codex-work"
+  }
+}
+```
+
+Use your own account IDs and paths. `workspace` is the initial folder for new sessions and “Last session”; individual sessions resume in their own folder. `launcher` is one executable path, called with arguments without interpreting it as shell code; use this to retain an existing company-folder guard. Without overrides, the launcher is `codex`, the initial folder is `~/Work` (or home), and the account label comes from Omarchy. Extra account homes must be account folders below Omarchy's Codex accounts directory; a renamed account may keep its previous folder name. `XDG_STATE_HOME` is respected when locating that directory. After a rename, an override under the retained account folder name continues to apply. An unknown, ambiguous or conflicting override produces a visible error and disables Codex launch rows until corrected, so a configured launcher is never silently dropped. Other agents remain available. Malformed local settings produce an error rather than silently using another launcher.
+
+The accounts may share settings or archived sessions through symlinks created by Omarchy. The plugin does not change these links. It only scans each account's `sessions` directory.
 
 ## Quota in the tooltip
 
@@ -157,10 +181,11 @@ The plugin only **reads**, and only these files:
 | What | Files | When |
 |---|---|---|
 | Claude sessions | `~/.claude/projects/*/*.jsonl`, `~/.claude/sessions/*.json` (or below `$CLAUDE_CONFIG_DIR`; from the latter only state, status and whether a Remote Control id is set, never its value) | menu, window |
-| Codex sessions | `~/.codex/session_index.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl` (first line for the lists, the window also the last 256 KB for context and tokens, the whole file for preview and search) | menu, window |
+| Codex sessions | `~/.codex/session_index.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl` and the same files in Omarchy-registered Codex account homes (first line for the lists, the window also the last 256 KB for context and tokens, the whole file for preview and search) | menu, window |
 | Agy sessions | below `~/.gemini/antigravity-cli/`: `cache/conversation_metadata.json`, `cache/last_conversations.json`; for preview and search (and, in the window, for the context number when not cached) `brain/<id>/.system_generated/logs/transcript_full.jsonl` (or `transcript.jsonl`) | menu, window |
 | opencode sessions | `~/.local/share/opencode/opencode.db` (sessions without archived and sub-agent ones), opened read-only (`mode=ro`, `query_only`): the content is never changed, but like any reader SQLite may create or refresh its helper files `opencode.db-shm` / `-wal` | window |
 | Experimental agents | `~/.copilot/session-state/*/events.jsonl` and `history-session-state/*.json`, `~/.pi/agent/sessions/**/*.jsonl`, `~/.gemini/tmp/*/chats/session-*.json(l)` and `.project_root`, `~/.grok/sessions/*/*/summary.json` and `subagents/*/meta.json` (or below `$GROK_HOME`); event logs only their first lines, JSON files up to 2 MB (Gemini's older single-file form up to 20 MB) | window |
+| Codex account configuration | `~/.local/state/omarchy/agents/accounts/codex.json` (only IDs, labels and expected home paths), optional `~/.config/agent-launchers/codex-accounts.json` | menu, window, status |
 | Running agents | `/proc`: which agent process runs and which window it belongs to | menu, window |
 | Quota | the usage files above; JSON files named after Agy (`*agy*`, `*antigravity*`, `*gemini*`, never `*token*`, `*auth*`, `*oauth*`, `*credential*`) below `~/.local/state/omarchy` and `~/.cache/omarchy` | tooltip, every 60 s |
 

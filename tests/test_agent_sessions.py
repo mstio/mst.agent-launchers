@@ -23,10 +23,12 @@ ID_X = "01a1aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee"  # Codex
 ID_Y = "66666666-6666-4666-8666-666666666666"  # Agy
 
 
-def lade(home):
+def lade(home, state_home=None, codex_home=None):
     """Skript als Modul laden; Pfade werden beim Import aus HOME/Umgebung gelesen."""
     env = {"HOME": home, "CLAUDE_CONFIG_DIR": os.path.join(home, ".claude"),
-           "XDG_CACHE_HOME": os.path.join(home, ".cache")}
+           "XDG_CACHE_HOME": os.path.join(home, ".cache"),
+           "XDG_STATE_HOME": state_home or os.path.join(home, ".local/state"),
+           "CODEX_HOME": codex_home or ""}
     sys.dont_write_bytecode = True  # kein __pycache__ im Plugin-Ordner
     with mock.patch.dict(os.environ, env):
         loader = importlib.machinery.SourceFileLoader("agent_sessions", str(SCRIPT))
@@ -640,6 +642,319 @@ class KennzahlenTest(unittest.TestCase):
         self.assertEqual(os.stat(self.m.METRIK_CACHE).st_mode & 0o777, 0o600)
         Path(self.m.METRIK_CACHE).write_text('{"v":2,"e":[]}')  # kaputt: neu aufbauen statt abbrechen
         self.assertEqual(self.m.metriken([("codex", c)]), {c: 70})
+
+
+class CodexKontenTest(unittest.TestCase):
+    tearDown = ClaudeSitzungenTest.tearDown
+
+    def setUp(self):
+        ClaudeSitzungenTest.setUp(self)
+        self.state = Path(self.home, ".local/state/omarchy/agents/accounts")
+        self.company = self.state / "codex" / "work"
+        self.company.mkdir(parents=True)
+        self.registry = self.state / "codex.json"
+        self.registry.write_text(json.dumps({"active": "work", "accounts": [
+            {"id": "main", "home": "", "label": "Main"},
+            {"id": "work", "home": str(self.company), "label": "Work"}]}))
+        source = next(Path(self.home, ".codex/sessions").rglob("rollout-*.jsonl"))
+        target = self.company / "sessions/2026/11/01"
+        target.mkdir(parents=True)
+        (target / source.name).write_text(source.read_text().replace("Router", "Firmenrouter"))
+        (self.company / "session_index.jsonl").write_text(zeile(id=ID_X, thread_name="Firmenfrage"))
+        self.config = Path(self.home, ".config/agent-launchers/codex-accounts.json")
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({"work": {"workspace": self.arbeit}}))
+
+    def test_beliebige_namen_ohne_persoenliche_konfiguration(self):
+        self.config.unlink()
+        d = json.loads(self.registry.read_text())
+        d["accounts"][0].update(id="zuhause", label="Persönlich – Alex", primary=True)
+        d["accounts"][1].update(id="buro-kunden", label="Büro & Kunden", primary=False)
+        third = self.state / "codex" / "team-alt"
+        third.mkdir()
+        d["accounts"].append({"id": "equipe-b", "label": "Équipe B", "home": str(third), "primary": False})
+        self.registry.write_text(json.dumps(d))
+        profiles = self.m.STATUS.codex_accounts()
+        self.assertEqual([p["id"] for p in profiles], ["zuhause", "buro-kunden", "equipe-b"])
+        self.assertEqual([p["label"] for p in profiles], ["Persönlich – Alex", "Büro & Kunden", "Équipe B"])
+        self.assertTrue(all(p["launcher"] == "codex" for p in profiles))
+        self.assertEqual([p["label"] for p in self.m.STATUS.codex_menu_accounts()],
+                         ["Codex · Persönlich – Alex", "Codex · Büro & Kunden", "Codex · Équipe B"])
+        with mock.patch.object(self.m.subprocess, "Popen") as popen:
+            self.m.oeffnen("codex:" + ID_X)
+            self.assertIn("CODEX_HOME=" + str(Path(self.home, ".codex")), popen.call_args.args[0])
+            self.m.oeffnen("codex:buro-kunden:" + ID_X)
+            self.assertIn("CODEX_HOME=" + str(self.company), popen.call_args.args[0])
+
+    def test_geaenderter_hauptkontoname_wird_uebernommen(self):
+        d = json.loads(self.registry.read_text())
+        d["accounts"][0].update(label="Mein Abo")
+        self.registry.write_text(json.dumps(d))
+        self.assertEqual(self.m.STATUS.codex_accounts()[0]["label"], "Mein Abo")
+
+    def test_xdg_state_home_mit_leerzeichen(self):
+        self.config.unlink()
+        import shutil
+        root = Path(self.home, "state with spaces")
+        accounts = root / "omarchy/agents/accounts"
+        target = accounts / "codex" / "old-account-name"
+        shutil.copytree(self.company, target)
+        (accounts / "codex.json").write_text(json.dumps({"accounts": [
+            {"id": "abo-2", "label": "Deuxième compte", "home": str(target), "primary": False}]}))
+        other = lade(self.home, str(root))
+        other.STATUS.window_pids = lambda: set()
+        profiles = other.STATUS.codex_accounts()
+        self.assertEqual([p["id"] for p in profiles], ["main", "abo-2"])
+        self.assertEqual(profiles[1]["home"], str(target))
+        self.assertEqual(other.STATUS.omarchy_usage_candidates(["codex"]), [root / "omarchy/agents/usage/codex.json"])
+        self.assertIn("CODEX_HOME=" + str(target), other.STATUS.codex_command("abo-2"))
+        self.assertTrue(any(row.startswith("codex:abo-2:" + ID_X + "\t") for row in other.liste("codex")))
+
+    def test_konto_entfernen_entfernt_menueeintrag(self):
+        self.config.unlink()
+        d = json.loads(self.registry.read_text())
+        d["accounts"] = d["accounts"][:1]
+        self.registry.write_text(json.dumps(d))
+        self.assertEqual([p["id"] for p in self.m.STATUS.codex_menu_accounts()], ["main"])
+
+    def test_guard_bleibt_bei_umbenennung_ueber_alten_ordnernamen_erhalten(self):
+        d = json.loads(self.registry.read_text())
+        d["accounts"][1].update(id="new-name", label="Neuer Name")
+        self.registry.write_text(json.dumps(d))
+        guard = str(Path(self.home, "company-guard"))
+        self.config.write_text(json.dumps({"work": {"launcher": guard}}))
+        self.assertIn(guard, self.m.STATUS.codex_command("new-name"))
+        self.config.write_text(json.dumps({"outdated-id": {"launcher": guard}}))
+        with self.assertRaises(ValueError):
+            self.m.STATUS.codex_command("new-name")
+
+    def test_defekte_konfiguration_liefert_sichtbaren_fehler_ohne_codex_befehle(self):
+        import contextlib, io
+        for broken in ("not json", json.dumps({"outdated-id": {"launcher": "/a/guard"}})):
+            self.config.write_text(broken)
+            for args in ([], ["--sessions"]):
+                out = io.StringIO()
+                with mock.patch.object(sys, "argv", ["status", *args]), contextlib.redirect_stdout(out), \
+                        mock.patch.object(self.m.STATUS, "claude_resumable", return_value=False), \
+                        mock.patch.object(self.m.STATUS, "agy_resumable", return_value=False), \
+                        mock.patch.object(self.m.STATUS, "claude_quota", return_value=[]), \
+                        mock.patch.object(self.m.STATUS, "agy_quota", return_value=[]), \
+                        mock.patch.object(self.m.STATUS, "sessions", return_value=[{"agent": "claude"}]):
+                    self.assertEqual(self.m.STATUS.main(), 0)
+                d = json.loads(out.getvalue())
+                self.assertEqual(d["codexAccounts"], [])
+                self.assertTrue(d["codexError"])
+                if args: self.assertEqual(d["sessions"], [{"agent": "claude"}])
+                else: self.assertIn("claude", d)
+
+    def test_defekte_registry_wird_nicht_als_main_interpretiert(self):
+        self.registry.write_text("not json")
+        with self.assertRaises(ValueError):
+            self.m.STATUS.codex_accounts()
+
+    def test_work_symlink_ausserhalb_home_und_expliziter_arbeitsordner(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(dir=Path(self.home).parent) as outside:
+            work = Path(self.home, "Work")
+            work.symlink_to(outside)
+            other = lade(self.home)
+            profiles = other.STATUS.codex_accounts()
+            self.assertEqual(profiles[0]["workspace"], outside)
+            self.config.write_text(json.dumps({"main": {"workspace": outside}}))
+            self.assertEqual(other.STATUS.codex_accounts()[0]["workspace"], outside)
+
+    def test_gleiche_kontonamen_werden_durch_ids_unterscheidbar(self):
+        d = json.loads(self.registry.read_text())
+        for entry in d["accounts"]: entry["label"] = "Gleich"
+        self.registry.write_text(json.dumps(d))
+        self.assertEqual([p["label"] for p in self.m.STATUS.codex_accounts()], ["Gleich (main)", "Gleich (work)"])
+
+    def test_geteilter_titel_im_barmenue_ohne_falschen_duplikat_suffix(self):
+        self._geteilt()
+        (self.company / "session_index.jsonl").unlink()
+        with mock.patch.object(self.m.STATUS, "window_pids", return_value=set()):
+            items = [i for i in self.m.STATUS.sessions() if i["agent"] == "codex"]
+        self.assertEqual(len(items), 2)
+        self.assertTrue(all(i["title"] == "Codex-Frage" for i in items))
+
+    def test_single_account_heisst_codex_und_fehlender_launcher_wird_gemeldet(self):
+        self.registry.unlink(); self.config.unlink()
+        self.assertEqual(self.m.STATUS.codex_menu_accounts()[0]["label"], "Codex")
+        with mock.patch.object(self.m.shutil, "which", side_effect=lambda s: None if s == "codex" else "/usr/bin/ok"), \
+                mock.patch.object(self.m, "melden") as notify, mock.patch.object(self.m.subprocess, "Popen") as popen:
+            self.m.oeffnen("codex:" + ID_X)
+            popen.assert_not_called()
+            self.assertIn("codex", notify.call_args.args[0])
+
+    def test_launcher_mit_gleichheitszeichen_wird_abgewiesen(self):
+        self.config.write_text(json.dumps({"work": {"launcher": str(Path(self.home, "x=y"))}}))
+        with self.assertRaises(ValueError):
+            self.m.STATUS.codex_command("work")
+
+    def test_ohne_registry_bleibt_ein_explizites_codex_home_erhalten(self):
+        self.registry.unlink(); self.config.unlink()
+        other = lade(self.home, codex_home=str(self.company))
+        self.assertEqual(other.STATUS.codex_accounts()[0]["home"], str(self.company))
+        self.assertIn("CODEX_HOME=" + str(self.company), other.STATUS.codex_command("main"))
+
+    def test_erststart_pinnt_main_ohne_fehlendes_home_explizit_zu_setzen(self):
+        import shutil
+        shutil.rmtree(Path(self.home, ".codex"))
+        command = self.m.STATUS.codex_command("main")
+        self.assertIn("CODEX_HOME=", command)
+        self.assertIn("OMARCHY_AGENT_CODEX_HOME=", command)
+        self.assertFalse(Path(self.home, ".codex").exists())
+
+    def test_launcher_tippfehler_faellt_nicht_still_auf_codex_zurueck(self):
+        self.config.write_text(json.dumps({"work": {"launcer": "/path/to/guard"}}))
+        with self.assertRaises(ValueError):
+            self.m.STATUS.codex_command("work")
+
+    def test_gleiche_sitzungs_id_bleibt_pro_konto_getrennt(self):
+        rows = self.m.liste("codex")
+        self.assertEqual({r.split("\t")[0] for r in rows}, {"codex:" + ID_X, "codex:work:" + ID_X})
+        self.assertTrue(any("Codex · Work" in r for r in rows))
+        self.assertEqual(self.m._andere_finden("codex:" + ID_X)["account"], "main")
+        self.assertEqual(self.m._andere_finden("codex:work:" + ID_X)["account"], "work")
+        self.assertIsNone(self.m._andere_finden("codex:unknown:" + ID_X))
+
+    def test_geteilter_verlauf_bleibt_mit_beiden_konten_fortsetzbar(self):
+        import shutil
+        shutil.rmtree(self.company / "sessions")
+        (self.company / "sessions").symlink_to(Path(self.home, ".codex/sessions"))
+        items = self.m.andere("codex")
+        self.assertEqual(len(items), 1)
+        self.assertEqual({c["id"] for c in items[0]["accounts"]}, {"main", "work"})
+        self.assertEqual(len({os.path.realpath(i["file"]) for i in items}), 1)
+        with mock.patch.object(self.m.subprocess, "Popen") as popen:
+            self.m.oeffnen("codex:work:" + ID_X)
+            self.assertIn("CODEX_HOME=" + str(self.company), popen.call_args.args[0])
+        self.assertTrue((self.company / "sessions").is_symlink())
+        real = os.path.realpath(items[0]["file"])
+        with mock.patch.object(self.m.STATUS, "codex_open_files", return_value={real: 123}), \
+                mock.patch.object(self.m.STATUS, "window_for", return_value=123):
+            shared = self.m.andere("codex")
+        self.assertTrue(all(i["active"] and i["focusPid"] == 123 for i in shared))
+
+    def _geteilt(self):
+        import shutil
+        shutil.rmtree(self.company / "sessions")
+        (self.company / "sessions").symlink_to(Path(self.home, ".codex/sessions"))
+
+    def test_geteilter_verlauf_nur_eine_zeile_und_ein_suchtreffer(self):
+        self._geteilt()
+        for agent in ("alle", "codex"):
+            rows = [r for r in self.m.liste(agent) if r.startswith("codex:")]
+            self.assertEqual(len(rows), 1)
+            self.assertIn("Codex-Frage", rows[0])
+            self.assertNotIn("Codex · Work", rows[0])
+            _, hits = self.m.inhaltssuche("router", agent)
+            self.assertEqual(hits["codex:" + ID_X], 3)
+            self.assertNotIn("codex:work:" + ID_X, hits)
+
+    def test_geteilten_verlauf_mit_gewaehltem_konto_fortsetzen(self):
+        from subprocess import CompletedProcess
+        self._geteilt()
+        with mock.patch.object(self.m.subprocess, "run", return_value=CompletedProcess([], 0, "work\tCodex · Work\n")) as run, \
+                mock.patch.object(self.m.subprocess, "Popen") as popen:
+            self.m.oeffnen("codex:" + ID_X)
+            self.assertIn("CODEX_HOME=" + str(self.company), popen.call_args.args[0])
+            self.assertEqual(run.call_args.args[0][0], "fzf")
+            self.assertIn("main\t", run.call_args.kwargs["input"])
+            self.assertIn("work\t", run.call_args.kwargs["input"])
+
+    def test_kontoauswahl_abbrechen_oder_unbekannt_startet_nichts(self):
+        from subprocess import CompletedProcess
+        self._geteilt()
+        for code, answer in ((130, ""), (0, "unknown\tInjected"), (0, "../../evil")):
+            with self.subTest(code=code, answer=answer), \
+                    mock.patch.object(self.m.subprocess, "run", return_value=CompletedProcess([], code, answer)), \
+                    mock.patch.object(self.m.subprocess, "Popen") as popen:
+                self.m.oeffnen("codex:" + ID_X)
+                popen.assert_not_called()
+
+    def test_offener_geteilter_verlauf_ohne_kontoauswahl_fokussiert(self):
+        self._geteilt()
+        item = self.m._andere_finden("codex:" + ID_X)
+        item.update(active=True, focusPid=123)
+        with mock.patch.object(self.m, "_andere_finden", return_value=item), \
+                mock.patch.object(self.m, "codex_konto_waehlen") as choose, \
+                mock.patch.object(self.m.subprocess, "run") as run, \
+                mock.patch.object(self.m.subprocess, "Popen") as popen:
+            self.m.oeffnen("codex:" + ID_X)
+            choose.assert_not_called()
+            popen.assert_not_called()
+            self.assertIn("pid:123", run.call_args.args[0][-1])
+
+    def test_firmenverlauf_in_vorschau_und_suche(self):
+        import contextlib
+        import io
+        _, hits = self.m.inhaltssuche("firmenrouter", "codex")
+        self.assertEqual(set(hits), {"codex:work:" + ID_X})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.m.vorschau("codex:work:" + ID_X)
+        self.assertIn("Firmenrouter", out.getvalue())
+        self.assertIn("Codex · Work", out.getvalue())
+
+    def test_oeffnen_pinnt_konto_trotz_geerbtem_firmenkonto(self):
+        with mock.patch.object(self.m.subprocess, "Popen") as popen, mock.patch.dict(os.environ, {
+                "CODEX_HOME": str(self.company), "OMARCHY_AGENT_CODEX_HOME": str(self.company)}):
+            self.m.oeffnen("codex:" + ID_X)
+            command = popen.call_args.args[0]
+            self.assertIn("CODEX_HOME=" + str(Path(self.home, ".codex")), command)
+            self.assertIn("OMARCHY_AGENT_CODEX_HOME=" + str(Path(self.home, ".codex")), command)
+            self.m.oeffnen("codex:work:" + ID_X)
+            self.assertIn("CODEX_HOME=" + str(self.company), popen.call_args.args[0])
+
+    def test_start_und_resume_fuehren_guard_als_argv_aus(self):
+        import subprocess
+        launcher = Path(self.home, "guard with spaces")
+        launcher.write_text('#!/usr/bin/python3\nimport json, os, sys\nprint(json.dumps([os.environ["CODEX_HOME"], os.environ["OMARCHY_AGENT_CODEX_HOME"], sys.argv[1:], os.getcwd()]))\n')
+        launcher.chmod(0o700)
+        self.config.write_text(json.dumps({"work": {"workspace": self.arbeit, "launcher": str(launcher)}}))
+        cmd = self.m.STATUS.codex_command("work", "resume", ID_X)
+        result = subprocess.run(cmd, cwd=self.arbeit, capture_output=True, text=True, check=True,
+                                env=dict(os.environ, CODEX_HOME="wrong", OMARCHY_AGENT_CODEX_HOME="wrong"))
+        self.assertEqual(json.loads(result.stdout), [str(self.company), str(self.company), ["resume", ID_X], self.arbeit])
+        profiles = self.m.STATUS.codex_menu_accounts()
+        self.assertEqual([p["id"] for p in profiles], ["main", "work"])
+        self.assertIn("'" + str(launcher) + "'", profiles[1]["newCommand"])
+        self.assertIn("resume --last", profiles[1]["lastCommand"])
+
+    def test_registry_kann_keinen_fremden_ordner_oder_befehl_einschleusen(self):
+        d = json.loads(self.registry.read_text())
+        d["accounts"] += [{"id": "../../evil", "home": self.home, "label": "Bad"},
+                          {"id": "fake", "home": self.home, "label": "Bad", "launcher": "/bin/false"}]
+        d["accounts"][1]["launcher"] = "/bin/false"
+        self.registry.write_text(json.dumps(d))
+        profiles = self.m.STATUS.codex_accounts()
+        self.assertEqual([p["id"] for p in profiles], ["main", "work"])
+        self.assertEqual(profiles[1]["launcher"], "codex")
+        with self.assertRaises(ValueError):
+            self.m.STATUS.codex_command("missing")
+        self.config.write_text("broken")
+        with self.assertRaises(ValueError):
+            self.m.STATUS.codex_accounts()
+
+    def test_laufende_firmensitzung_wird_fokussiert(self):
+        item = self.m._andere_finden("codex:work:" + ID_X)
+        item.update(active=True, focusPid=123)
+        with mock.patch.object(self.m, "_andere_finden", return_value=item), \
+                mock.patch.object(self.m.subprocess, "run") as run, \
+                mock.patch.object(self.m.subprocess, "Popen") as popen:
+            self.m.oeffnen("codex:work:" + ID_X)
+            popen.assert_not_called()
+            self.assertIn("pid:123", run.call_args.args[0][-1])
+
+    def test_quota_wird_pro_konto_beschriftet(self):
+        usage = {"accounts": [{"id": "main", "plan": "Plus", "limits": [{"label": "Weekly", "percent": 0.1}]},
+                               {"id": "work", "plan": "Team", "limits": [{"label": "Weekly", "percent": 0.7}]}]}
+        with mock.patch.object(self.m.STATUS, "omarchy_usage_candidates", return_value=[Path("unused")]), \
+                mock.patch.object(self.m.STATUS, "read_json", side_effect=lambda p: usage if str(p) == "unused" else json.loads(p.read_text()) if p.exists() else None):
+            text = "\n".join(self.m.STATUS.codex_quota())
+        for value in ("Main", "Work", "90%", "30%"):
+            self.assertIn(value, text)
 
 
 if __name__ == "__main__":

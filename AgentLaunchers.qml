@@ -43,6 +43,7 @@ Item {
     // Recent and running sessions of all agents (bin/agent-launcher-status
     // --sessions), read only when the menu opens.
     property var sessionList: []
+    property var codexAccounts: []
     property bool sessionsLoading: false
     property string expandedAgent: ""
 
@@ -58,24 +59,30 @@ Item {
         expandedAgent = ""
     }
 
-    function sessionsFor(agent) {
+    function sessionsFor(agent, account) {
         var out = []
         for (var i = 0; i < sessionList.length; i++)
-            if (sessionList[i].agent === agent)
+            if (sessionList[i].agent === agent && (agent !== "codex" || sessionList[i].account === account))
                 out.push(sessionList[i])
         return out
     }
 
-    function launchAgent(agent, resume) {
+    function launchAgent(agent, resume, account) {
         menuOpen = false
         expandedAgent = ""
         if (!bar)
             return
 
         var command
-        if (agent === "codex")
-            command = resume ? "codex resume --last" : "codex"
-        else if (agent === "claude")
+        if (agent === "codex") {
+            for (var i = 0; i < codexAccounts.length; i++) {
+                if (codexAccounts[i].id === account) {
+                    bar.run(resume ? codexAccounts[i].lastCommand : codexAccounts[i].newCommand)
+                    return
+                }
+            }
+            return
+        } else if (agent === "claude")
             command = resume ? "claude --continue" : "claude"
         else
             command = resume ? "agy -c" : "agy"
@@ -84,6 +91,26 @@ Item {
         // --dangerously-skip-permissions. The user chooses the agent explicitly.
         // ~/Work legt Omarchy an; fehlt er, im Home starten statt stumm zu scheitern.
         bar.run("{ cd \"$HOME/Work\" 2>/dev/null || cd \"$HOME\"; } && omarchy-launch-tui --app-id=org.omarchy.agent " + command)
+    }
+
+    function menuRows() {
+        var rows = [
+            { label: "Claude", agent: "claude", resume: false },
+            { label: t("Claude fortsetzen", "Resume Claude"), agent: "claude", resume: true },
+            { separator: true }
+        ]
+        for (var i = 0; i < codexAccounts.length; i++) {
+            var p = codexAccounts[i]
+            rows.push({ label: p.label, agent: "codex", account: p.id, resume: false })
+            rows.push({ label: t(p.label + " fortsetzen", "Resume " + p.label), agent: "codex", account: p.id,
+                        workspace: p.workspace, resume: true })
+        }
+        rows.push({ separator: true })
+        rows.push({ label: "Agy", agent: "agy", resume: false })
+        rows.push({ label: t("Agy fortsetzen", "Resume Agy"), agent: "agy", resume: true })
+        rows.push({ separator: true })
+        rows.push({ label: t("Alle Sitzungen …", "All sessions …"), browse: true })
+        return rows
     }
 
     function openSession(item) {
@@ -135,9 +162,20 @@ Item {
             statusProcess.running = true
     }
 
+    function applyCodexState(data) {
+        var accounts = data.codexAccounts || []
+        if (JSON.stringify(codexAccounts) !== JSON.stringify(accounts))
+            codexAccounts = accounts
+        if (data.codexError) {
+            codexResumable = false
+            codexTooltip = "Codex\n" + String(data.codexError)
+        }
+    }
+
     function applyStatus(text) {
         try {
             var data = JSON.parse(String(text || "{}"))
+            applyCodexState(data)
             if (data.codex) {
                 codexResumable = data.codex.resumable === true
                 codexTooltip = String(data.codex.tooltip || "Codex")
@@ -151,6 +189,7 @@ Item {
                 claudeTooltip = String(data.claude.tooltip || "Claude")
             }
         } catch (e) {
+            codexAccounts = []
             var failed = t("Status konnte nicht gelesen werden", "Could not read status")
             codexTooltip = "Codex\n" + failed
             agyTooltip = "Agy\n" + failed
@@ -168,6 +207,8 @@ Item {
         onExited: function(exitCode) {
             if (exitCode === 0)
                 root.applyStatus(statusStdout.text)
+            else
+                root.applyCodexState({ codexError: root.t("Status konnte nicht gelesen werden", "Could not read status") })
         }
     }
 
@@ -180,12 +221,18 @@ Item {
         }
         onExited: function(exitCode) {
             root.sessionsLoading = false
-            if (exitCode !== 0)
+            if (exitCode !== 0) {
+                root.sessionList = []
+                root.applyCodexState({ codexError: root.t("Sitzungen konnten nicht gelesen werden", "Could not read sessions") })
                 return
+            }
             try {
-                root.sessionList = JSON.parse(String(sessionsStdout.text || "{}")).sessions || []
+                var data = JSON.parse(String(sessionsStdout.text || "{}"))
+                root.sessionList = data.sessions || []
+                root.applyCodexState(data)
             } catch (e) {
                 root.sessionList = []
+                root.applyCodexState({ codexError: root.t("Sitzungen konnten nicht gelesen werden", "Could not read sessions") })
             }
         }
     }
@@ -297,28 +344,18 @@ Item {
             spacing: 0
 
             Repeater {
-                model: [
-                    { "label": "Claude", "agent": "claude", "resume": false },
-                    { "label": root.t("Claude fortsetzen", "Resume Claude"), "agent": "claude", "resume": true },
-                    { "separator": true },
-                    { "label": "Codex", "agent": "codex", "resume": false },
-                    { "label": root.t("Codex fortsetzen", "Resume Codex"), "agent": "codex", "resume": true },
-                    { "separator": true },
-                    { "label": "Agy", "agent": "agy", "resume": false },
-                    { "label": root.t("Agy fortsetzen", "Resume Agy"), "agent": "agy", "resume": true },
-                    { "separator": true },
-                    { "label": root.t("Alle Sitzungen …", "All sessions …"), "browse": true }
-                ]
+                model: root.menuRows()
 
                 delegate: Column {
                     id: menuRow
                     required property var modelData
                     readonly property bool separator: modelData.separator === true
                     readonly property bool isResume: !separator && modelData.resume === true
-                    readonly property bool expanded: isResume && root.expandedAgent === modelData.agent
-                    readonly property var agentSessions: isResume ? root.sessionsFor(modelData.agent) : []
+                    readonly property string rowKey: String(modelData.agent || "") + ":" + String(modelData.account || "")
+                    readonly property bool expanded: isResume && root.expandedAgent === rowKey
+                    readonly property var agentSessions: isResume ? root.sessionsFor(modelData.agent, modelData.account) : []
                     // Resume without a detected ~/Work session stays usable but dimmed.
-                    readonly property bool resumeAvailable: isResume && (root.resumableFor(modelData.agent) || agentSessions.length > 0)
+                    readonly property bool resumeAvailable: isResume && ((modelData.agent !== "codex" && root.resumableFor(modelData.agent)) || agentSessions.length > 0)
 
                     width: menuColumn.width
                     spacing: 0
@@ -351,6 +388,10 @@ Item {
                             anchors.verticalCenter: parent.verticalCenter
                             anchors.left: parent.left
                             anchors.leftMargin: Style.space(10)
+                            anchors.right: parent.right
+                            anchors.rightMargin: menuRow.isResume ? Style.space(40) : Style.space(10)
+                            elide: Text.ElideRight
+                            textFormat: Text.PlainText
                             text: String(menuRow.modelData.label || "")
                             color: root.foreground
                             opacity: menuRow.isResume && !menuRow.resumeAvailable ? 0.5 : 1.0
@@ -379,9 +420,9 @@ Item {
                                 if (menuRow.modelData.browse === true)
                                     root.openBrowser()
                                 else if (menuRow.isResume)
-                                    root.expandedAgent = menuRow.expanded ? "" : menuRow.modelData.agent
+                                    root.expandedAgent = menuRow.expanded ? "" : menuRow.rowKey
                                 else
-                                    root.launchAgent(menuRow.modelData.agent, false)
+                                    root.launchAgent(menuRow.modelData.agent, false, menuRow.modelData.account)
                             }
                         }
                     }
@@ -419,7 +460,7 @@ Item {
                                 anchors.topMargin: subRow.isLast || subRow.isEmpty ? Style.space(6) : Style.space(3)
                                 elide: Text.ElideRight
                                 textFormat: Text.PlainText  // Titel = Modellausgabe, nie als Rich Text deuten
-                                text: subRow.isLast ? root.t("Letzte Sitzung in ~/Work", "Last session in ~/Work")
+                                text: subRow.isLast ? root.t("Letzte Sitzung in ", "Last session in ") + String(menuRow.modelData.workspace || "~/Work")
                                     : subRow.isEmpty ? root.t("keine weiteren Sitzungen (14 Tage)", "no other sessions (14 days)")
                                     : (subRow.modelData.active ? "● " : "") + String(subRow.modelData.title || "")
                                 color: root.foreground
@@ -450,7 +491,7 @@ Item {
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
                                     if (subRow.isLast)
-                                        root.launchAgent(menuRow.modelData.agent, true)
+                                        root.launchAgent(menuRow.modelData.agent, true, menuRow.modelData.account)
                                     else
                                         root.openSession(subRow.modelData)
                                 }

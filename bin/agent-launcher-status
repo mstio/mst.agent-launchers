@@ -21,6 +21,8 @@ from typing import Any, Iterable
 
 HOME = pathlib.Path.home()
 WORK = (HOME / "Work").resolve()
+STATE_HOME = pathlib.Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+DEFAULT_CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or HOME / ".codex").expanduser()
 
 
 def lang() -> str:
@@ -78,8 +80,112 @@ def normalize_fraction(value: Any, *, already_percent: bool = False) -> float | 
     return max(0.0, min(1.0, x))
 
 
+def codex_accounts() -> list[dict]:
+    """Use Omarchy's existing homes; never copy credentials or change active account.
+
+    Optional, deliberately maintained local settings: label, workspace and an
+    executable launcher (e.g. an existing company-folder guard), never shell code.
+    """
+    state = STATE_HOME / "omarchy/agents/accounts"
+    registry_path = state / "codex.json"
+    registry = read_json(registry_path)
+    if registry_path.exists() and not isinstance(registry, dict):
+        raise ValueError("Invalid Omarchy Codex account registry")
+    entries = registry.get("accounts", []) if isinstance(registry, dict) else []
+    if not isinstance(entries, list):
+        raise ValueError("Invalid Omarchy Codex account registry")
+    profiles = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        aid = entry.get("id")
+        if not isinstance(aid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", aid):
+            continue
+        primary = entry.get("primary") is True or (aid == "main" and not entry.get("home"))
+        if primary:
+            expected = HOME / ".codex"
+            if any(p["primary"] for p in profiles):
+                continue
+        else:
+            # Omarchy rename changes ID and label but deliberately keeps home.
+            # Accept a single account folder below the provider's known root.
+            expected = pathlib.Path(str(entry.get("home") or ""))
+            if (expected.parent != state / "codex" or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", expected.name)
+                    or not expected.is_dir()):
+                continue
+        if any(p["id"] == aid for p in profiles):
+            continue
+        profiles.append({"id": aid, "label": str(entry.get("label") or aid), "home": str(expected), "primary": primary})
+    if not any(p["primary"] for p in profiles):
+        home = HOME / ".codex" if registry_path.exists() else DEFAULT_CODEX_HOME
+        if not home.is_absolute():
+            raise ValueError("CODEX_HOME must be an absolute path")
+        profiles.insert(0, {"id": "main", "label": "Main", "home": str(home), "primary": True})
+    profiles.sort(key=lambda p: not p["primary"])
+    config = HOME / ".config/agent-launchers/codex-accounts.json"
+    overrides = read_json(config)
+    if config.exists() and not isinstance(overrides, dict):
+        raise ValueError(f"Invalid Codex account settings: {config}")
+    resolved = {}
+    for key, opts in (overrides or {}).items():
+        matches = [p for p in profiles if key in (p["id"], "main" if p["primary"] else pathlib.Path(p["home"]).name)]
+        if len(matches) != 1 or not isinstance(opts, dict):
+            raise ValueError(f"Unknown, ambiguous or invalid Codex override: {key}")
+        if set(opts) - {"label", "workspace", "launcher"}:
+            raise ValueError(f"Unknown Codex override option: {key}")
+        merged = resolved.setdefault(matches[0]["id"], {})
+        if any(k in merged and merged[k] != v for k, v in opts.items()):
+            raise ValueError(f"Conflicting Codex overrides: {key}")
+        merged.update(opts)
+    for profile in profiles:
+        opts = resolved.get(profile["id"], {})
+        profile["label"] = re.sub(r"\s+", " ", CTRL.sub("", str(opts.get("label", profile["label"]))))[:60]
+        workspace = pathlib.Path(opts.get("workspace", str(WORK if WORK.is_dir() else HOME))).expanduser()
+        if not workspace.is_absolute() or not workspace.is_dir():
+            raise ValueError(f"Invalid Codex workspace: {profile['id']}")
+        launcher = opts.get("launcher", "codex")
+        if not isinstance(launcher, str) or "=" in launcher or not (launcher == "codex" or pathlib.Path(launcher).is_absolute()):
+            raise ValueError(f"Invalid Codex launcher: {profile['id']}")
+        profile.update(workspace=str(workspace), launcher=launcher)
+    labels = [p["label"] for p in profiles]
+    for profile in profiles:
+        if labels.count(profile["label"]) > 1:
+            profile["label"] += f" ({profile['id']})"
+        profile["display"] = "Codex" if len(profiles) == 1 else "Codex · " + profile["label"]
+    return profiles
+
+
+def codex_command(account: str, *args: str) -> list[str]:
+    profile = next((p for p in codex_accounts() if p["id"] == account), None)
+    if profile is None:
+        raise ValueError(f"Unknown Codex account: {account}")
+    return _codex_command(profile, *args)
+
+
+def _codex_command(profile: dict, *args: str) -> list[str]:
+    # Explicit homes win over both inherited pins and Omarchy's selected account.
+    home = profile["home"]
+    # Codex creates its implicit default, but rejects an explicit missing home.
+    # An empty Omarchy pin keeps Main selected even if another account is active.
+    if profile["primary"] and pathlib.Path(home) == HOME / ".codex" and not pathlib.Path(home).exists():
+        home = ""
+    return ["env", f"CODEX_HOME={home}", f"OMARCHY_AGENT_CODEX_HOME={home}",
+            profile["launcher"], *args]
+
+
+def codex_menu_accounts() -> list[dict]:
+    return [{"id": p["id"], "label": p["display"], "workspace": short_path(p["workspace"]),
+             "newCommand": launch(p["workspace"], shlex.join(_codex_command(p))),
+             "lastCommand": launch(p["workspace"], shlex.join(_codex_command(p, "resume", "--last")))}
+            for p in codex_accounts()]
+
+
 def codex_resumable() -> bool:
-    sessions = HOME / ".codex" / "sessions"
+    return any(_codex_resumable(pathlib.Path(p["home"]), p["workspace"]) for p in codex_accounts())
+
+
+def _codex_resumable(home: pathlib.Path, workspace: str) -> bool:
+    sessions = home / "sessions"
     if not sessions.is_dir():
         return False
     try:
@@ -87,7 +193,7 @@ def codex_resumable() -> bool:
     except OSError:
         return False
 
-    target = str(WORK)
+    target = str(pathlib.Path(workspace).resolve())
     for path in files:
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -152,7 +258,7 @@ def claude_resumable() -> bool:
 
 
 def omarchy_usage_candidates(ids: Iterable[str]) -> list[pathlib.Path]:
-    root = HOME / ".local" / "state" / "omarchy" / "agents" / "usage"
+    root = STATE_HOME / "omarchy" / "agents" / "usage"
     return [root / f"{name}.json" for name in ids]
 
 
@@ -186,6 +292,19 @@ def parse_omarchy_limits(data: Any) -> tuple[str, list[str]] | None:
 def codex_quota() -> list[str]:
     for path in omarchy_usage_candidates(["codex"]):
         data = read_json(path)
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if isinstance(accounts, list) and accounts:
+            lines = []
+            labels = {p["id"]: p["label"] for p in codex_accounts()}
+            for account in accounts:
+                if not isinstance(account, dict) or account.get("id") not in labels:
+                    continue
+                parsed = parse_omarchy_limits(account)
+                label = labels[account["id"]]
+                lines.append(label + (" · " + str(account.get("plan")) if account.get("plan") else ""))
+                lines.extend(parsed[1] if parsed else [tr("Kein lokaler Quotenstand", "No local quota record")])
+            if lines:
+                return lines
         parsed = parse_omarchy_limits(data)
         if parsed:
             tier, lines = parsed
@@ -480,17 +599,16 @@ def claude_sessions(windows: set[int], since: float) -> list[dict]:
 
 
 def codex_sessions(windows: set[int], since: float, limit: int | None = 40) -> list[dict]:
-    names: dict[str, str] = {}
-    try:
-        with (HOME / ".codex" / "session_index.jsonl").open("r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                try:
-                    obj = json.loads(line)
-                    names[str(obj["id"])] = str(obj.get("thread_name") or "")
-                except (ValueError, KeyError, TypeError):
-                    continue
-    except OSError:
-        pass
+    open_by = codex_open_files()
+    items = [i for profile in codex_accounts() for i in _codex_sessions(profile, windows, since, limit, open_by)]
+    titles = {os.path.realpath(i["file"]): i["title"] for i in items if i["title"] not in (i["id"], i["id"][:8])}
+    for item in items:
+        if item["title"] in (item["id"], item["id"][:8]):
+            item["title"] = titles.get(os.path.realpath(item["file"]), item["title"])
+    return items
+
+
+def codex_open_files() -> dict[str, int]:
     # Running TUIs: rollout file held open by a codex process.
     open_by: dict[str, int] = {}
     for proc in pathlib.Path("/proc").iterdir():
@@ -502,17 +620,34 @@ def codex_sessions(windows: set[int], since: float, limit: int | None = 40) -> l
             for fd in (proc / "fd").iterdir():
                 target = os.readlink(fd)
                 if "/rollout-" in target and target.endswith(".jsonl"):
-                    open_by[target] = int(proc.name)
+                    open_by[os.path.realpath(target)] = int(proc.name)
         except OSError:
             continue
+    return open_by
+
+
+def _codex_sessions(profile: dict, windows: set[int], since: float, limit: int | None, open_by: dict[str, int]) -> list[dict]:
+    home = pathlib.Path(profile["home"])
+    resume_command = _codex_command(profile, "resume")
+    names: dict[str, str] = {}
     try:
-        files = [(p.stat().st_mtime, p) for p in (HOME / ".codex" / "sessions").glob("*/*/*/rollout-*.jsonl")]
+        with (home / "session_index.jsonl").open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                    names[str(obj["id"])] = str(obj.get("thread_name") or "")
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    try:
+        files = [(p.stat().st_mtime, p) for p in (home / "sessions").glob("*/*/*/rollout-*.jsonl")]
     except OSError:
         files = []
     files.sort(reverse=True)
     out = []
     for mtime, path in files[:limit]:
-        pid = open_by.get(str(path), 0)
+        pid = open_by.get(str(path.resolve()), 0)
         if mtime < since and not pid:
             continue
         try:
@@ -525,9 +660,10 @@ def codex_sessions(windows: set[int], since: float, limit: int | None = 40) -> l
             continue  # interne Laeufe (z. B. Guardian review) auslassen
         if not cwd or cwd.startswith("/tmp/") or not pathlib.Path(cwd).is_dir():
             continue
-        out.append({"agent": "codex", "label": "Codex", "id": sid, "title": names.get(sid) or sid[:8],
+        out.append({"agent": "codex", "label": profile["display"], "account": profile["id"],
+                    "primary": profile["primary"], "id": sid, "title": names.get(sid) or sid[:8],
                     "cwd": short_path(cwd), "path": cwd, "file": str(path), "updated": mtime,
-                    "active": bool(pid), "status": "", "command": launch(cwd, f"codex resume {sid}"),
+                    "active": bool(pid), "status": "", "command": launch(cwd, shlex.join(resume_command + [sid])),
                     "focusPid": window_for(pid, windows) if pid else 0})
     return out
 
@@ -576,11 +712,12 @@ def sessions() -> list[dict]:
         except Exception:  # eine kaputte Quelle soll die anderen nicht verhindern
             continue
     items.sort(key=lambda i: (not i["active"], -i["updated"]))
-    per_agent: dict[str, int] = {}
+    per_agent: dict[tuple[str, str], int] = {}
     kept = []
     for i in items:  # hoechstens SESSION_LIMIT je Agent (Unterpunkte im Menue)
-        per_agent[i["agent"]] = per_agent.get(i["agent"], 0) + 1
-        if per_agent[i["agent"]] <= SESSION_LIMIT:
+        group = (i["agent"], i.get("account", ""))
+        per_agent[group] = per_agent.get(group, 0) + 1
+        if per_agent[group] <= SESSION_LIMIT:
             kept.append(i)
     items = kept
     for i in items:
@@ -589,9 +726,10 @@ def sessions() -> list[dict]:
     # Gleich lautende Titel desselben Agenten unterscheidbar machen
     counts: dict[tuple[str, str], int] = {}
     for i in items:
-        counts[(i["agent"], i["title"])] = counts.get((i["agent"], i["title"]), 0) + 1
+        key = (i["agent"], i.get("account", ""), i["title"])
+        counts[key] = counts.get(key, 0) + 1
     for i in items:
-        if counts[(i["agent"], i["title"])] > 1:
+        if counts[(i["agent"], i.get("account", ""), i["title"])] > 1:
             i["title"] = f"{i['title'][:40]} ({i['id'][:6]})"
     for i in items:
         state = ({"busy": tr("arbeitet", "working"), "idle": tr("wartet", "waiting")}.get(i["status"], tr("läuft", "running"))
@@ -613,17 +751,26 @@ def main() -> int:
         i = args.index("--lang")
         if i + 1 < len(args) and args[i + 1] in ("de", "en"):
             os.environ["AGENT_LAUNCHERS_LANG"] = args[i + 1]
+    codex_error = ""
+    codex = {"resumable": False, "tooltip": "Codex"}
+    try:
+        accounts = codex_menu_accounts()
+        if "--sessions" not in args:
+            codex = {"resumable": codex_resumable(),
+                     "tooltip": "Codex\n" + tr("Konto beim Start und Fortsetzen ausdrücklich wählen", "Choose the account when launching or resuming") + "\n" + "\n".join(codex_quota())}
+    except (OSError, ValueError, TypeError) as exc:
+        accounts = []
+        codex_error = re.sub(r"\s+", " ", CTRL.sub("", str(exc)))[:240]
+        codex = {"resumable": False, "tooltip": "Codex\n" + codex_error}
     if "--sessions" in args:
-        print(json.dumps({"sessions": sessions()}, ensure_ascii=False))
+        print(json.dumps({"sessions": sessions(), "codexAccounts": accounts, "codexError": codex_error}, ensure_ascii=False))
         return 0
-    c_resume = codex_resumable()
     a_resume = agy_resumable()
     cl_resume = claude_resumable()
     result = {
-        "codex": {
-            "resumable": c_resume,
-            "tooltip": tooltip("Codex", c_resume, codex_quota()),
-        },
+        "codexAccounts": accounts,
+        "codexError": codex_error,
+        "codex": codex,
         "agy": {
             "resumable": a_resume,
             "tooltip": tooltip("Agy / Antigravity", a_resume, agy_quota()),
