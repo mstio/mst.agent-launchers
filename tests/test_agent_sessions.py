@@ -162,6 +162,27 @@ class ClaudeSitzungenTest(unittest.TestCase):
         self.assertEqual(os.stat(self.m.CACHE).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(os.path.dirname(self.m.CACHE)).st_mode & 0o777, 0o700)
 
+    def test_cache_schreiben_folgt_keinem_symlink(self):
+        # Marktplatz-Pruefung #14940: fester .tmp-Name mit O_TRUNC folgte
+        # einem Symlink und kuerzte dessen Ziel.
+        opfer = os.path.join(self.home, "opfer.txt")
+        with open(opfer, "w") as f:
+            f.write("bleibt")
+        os.makedirs(os.path.dirname(self.m.CACHE), mode=0o700, exist_ok=True)
+        os.symlink(opfer, self.m.CACHE + ".tmp")
+        os.symlink(opfer, f"{self.m.METRIK_CACHE}.{os.getpid()}.tmp")
+        self.m.index()
+        with open(opfer) as f:
+            self.assertEqual(f.read(), "bleibt")
+        self.m._atomar_json(self.m.METRIK_CACHE, {"v": 2, "e": {}})
+        with open(opfer) as f:
+            self.assertEqual(f.read(), "bleibt")
+        self.assertFalse(os.path.islink(self.m.CACHE))
+        self.assertEqual(os.stat(self.m.CACHE).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(self.m.METRIK_CACHE).st_mode & 0o777, 0o600)
+        reste = [n for n in os.listdir(os.path.dirname(self.m.CACHE)) if n.startswith(".") and n.endswith(".tmp")]
+        self.assertEqual(reste, [])
+
     def test_inhaltssuche_mit_anfuehrungszeichen_und_backslash(self):
         a = self.arbeit
         sitzung(self.home, ID_E, a, [user('Was macht "rm -rf" in C:\\Temp?', a)])

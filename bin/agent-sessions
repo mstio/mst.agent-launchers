@@ -42,6 +42,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from datetime import date, datetime, timedelta
@@ -370,6 +371,28 @@ def metrik_agy(pfad):
 METRIK_CACHE = os.path.join(os.path.dirname(CACHE), "metrik.json")
 
 
+def _atomar_json(ziel, daten):
+    """Schreibt JSON atomar und nur fuer den Nutzer lesbar (0600, Ordner 0700).
+
+    Eigene Zwischendatei je Aufruf (mkstemp: O_EXCL, folgt keinem Symlink),
+    damit gleichzeitige Aufrufe sich nicht stoeren und ein vorhandener Link
+    nie ein fremdes Ziel kuerzt (Marktplatz-Pruefung #14940). Wirft OSError.
+    """
+    ordner = os.path.dirname(ziel)
+    os.makedirs(ordner, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=ordner, prefix="." + os.path.basename(ziel) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(daten, f)
+        os.replace(tmp, ziel)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def metriken(paare):
     """{Datei: Kontext} fuer die Liste, alle Agenten in einem Aufruf (sonst verdraengt einer
     den anderen im Cache). Cache nach mtime/Groesse, enthaelt nur Pfad, Schluessel, Zahl."""
@@ -398,13 +421,7 @@ def metriken(paare):
         neu[pfad] = {"k": k, "ctx": _int(e.get("ctx"))}
     if neu != alt:
         try:
-            os.makedirs(os.path.dirname(METRIK_CACHE), mode=0o700, exist_ok=True)
-            tmp = f"{METRIK_CACHE}.{os.getpid()}.tmp"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                os.fchmod(f.fileno(), 0o600)
-                json.dump({"v": 2, "e": neu}, f)
-            os.replace(tmp, METRIK_CACHE)
+            _atomar_json(METRIK_CACHE, {"v": 2, "e": neu})
         except OSError:
             pass
     return {pfad: e["ctx"] for pfad, e in neu.items()}
@@ -562,13 +579,7 @@ def index():
     try:
         # Nur fuer den Nutzer lesbar: der Index enthaelt Gespraechsauszuege
         # (die Verlaufsdateien selbst sind 0600).
-        os.makedirs(os.path.dirname(CACHE), mode=0o700, exist_ok=True)
-        tmp = CACHE + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            os.fchmod(f.fileno(), 0o600)
-            json.dump({"v": VERSION, "e": neu}, f)
-        os.replace(tmp, CACHE)
+        _atomar_json(CACHE, {"v": VERSION, "e": neu})
     except OSError:
         pass
     # Nur Sitzungen mit eigener Eingabe, deren Ordner noch existiert: Andere
